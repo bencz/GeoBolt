@@ -127,8 +127,3 @@ PRs and issues are welcome once the GitHub repository is published. Suggested ar
 - Additional heuristics for adaptive range subdivision.
 - Alternative distance metrics (Vincenty, ECEF).
 - Bindings for Rust/Python/Go.
-
-## License
-
-Choose the license that best matches your distribution goals (MIT, Apache-2.0, etc.).
-Add the corresponding `LICENSE` file before publishing on GitHub.
