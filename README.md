@@ -16,6 +16,17 @@ suite that benchmarks millions of operations per second.
 - **Battle-tested** – 39 deterministic tests cover correctness, numerical stability,
   edge cases (poles, antimeridian), stress, and performance regressions.
 
+## Repository Layout
+
+```
+.
+├── geo_index.h        # Public API
+├── geo_index.c        # Implementation
+├── main.c             # Demo program
+├── test_geo_index.c   # Comprehensive test suite
+└── Makefile           # Build + test orchestration
+```
+
 ## Getting Started
 
 ### Requirements
@@ -116,3 +127,8 @@ PRs and issues are welcome once the GitHub repository is published. Suggested ar
 - Additional heuristics for adaptive range subdivision.
 - Alternative distance metrics (Vincenty, ECEF).
 - Bindings for Rust/Python/Go.
+
+## License
+
+Choose the license that best matches your distribution goals (MIT, Apache-2.0, etc.).
+Add the corresponding `LICENSE` file before publishing on GitHub.
