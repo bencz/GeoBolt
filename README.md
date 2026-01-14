@@ -16,17 +16,6 @@ suite that benchmarks millions of operations per second.
 - **Battle-tested** – 39 deterministic tests cover correctness, numerical stability,
   edge cases (poles, antimeridian), stress, and performance regressions.
 
-## Repository Layout
-
-```
-.
-├── geo_index.h        # Public API
-├── geo_index.c        # Implementation
-├── main.c             # Demo program
-├── test_geo_index.c   # Comprehensive test suite
-└── Makefile           # Build + test orchestration
-```
-
 ## Getting Started
 
 ### Requirements
