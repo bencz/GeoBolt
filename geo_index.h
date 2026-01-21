@@ -186,6 +186,14 @@ double geo_clamp_lng(double lng);
 // Wrap longitude to [-180, 180]
 double geo_wrap_lng(double lng);
 
+// =========================================================
+// SIMD Optimizations (optional)
+// =========================================================
+
+#ifndef GEO_INDEX_NO_SIMD
+#include "geo_index_simd.h"
+#endif
+
 #ifdef __cplusplus
 }
 #endif

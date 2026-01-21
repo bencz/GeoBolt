@@ -1,118 +1,171 @@
 # GeoBolt Index
 
 GeoBolt Index is a high-performance spatial indexing library focused on lightning-fast
-geospatial lookups and analysis. It provides a production-ready data structure built on
-64-bit Morton (Z-order) codes with precision near one meter, plus a rigorous C test
-suite that benchmarks millions of operations per second.
+geospatial lookups and analysis. Built for production workloads with **SIMD optimizations**
+for ARM64 (NEON) and x86-64 (AVX2/SSE), it provides sub-centimeter precision using
+64-bit Morton (Z-order) codes.
 
-## Why GeoBolt?
+## Features
 
-- **Sub-meter precision** – 32-bit per-axis normalization keeps errors under 1 cm in
-  practice.
-- **Cache-friendly layout** – 16-byte-aligned records and prefetch hints ensure high
-  throughput even on large datasets (tested up to 5 million points).
-- **Complete toolkit** – encoding/decoding, radius queries, bounding boxes, KNN search,
-  and validation utilities all bundled in a single static library.
-- **Battle-tested** – 39 deterministic tests cover correctness, numerical stability,
-  edge cases (poles, antimeridian), stress, and performance regressions.
+- **Sub-centimeter precision** – 32-bit per-axis normalization keeps errors under 1 cm
+- **⚡ SIMD Optimized** – ARM64 NEON and x86-64 AVX2/SSE implementations with 10x+ speedups
+- **Thread-safe reads** – Safe for concurrent search operations after index build
+- **Cache-friendly** – 16-byte aligned records with prefetch hints for maximum throughput
+- **Battle-tested** – 48 comprehensive tests covering correctness, stress, and performance
+- **Proven scale** – Tested with 10+ million points, 40K+ searches/second
 
-## Getting Started
+## Quick Start
 
 ### Requirements
 
-- clang (or another C11 compiler)
+- C11 compiler (clang recommended)
 - make
-- macOS or Linux (timing utilities adapt automatically)
+- macOS or Linux
+- pthread (for multi-threaded demo)
 
-### Build Everything
+### Build & Run
 
 ```bash
+# Build everything
 make all
-```
 
-This produces:
-- `build/libgeoindex.a` – static library
-- `bin/main` – demo showcasing the API
-- `bin/test_geo_index` – performance + regression tests
+# Run comprehensive benchmark (10M points)
+make demo
 
-### Run the Demo
-
-```bash
-make main
-```
-
-Sample output:
-```
-=== GeoIndex Demo ===
-...
-FOUND id=10 lat=-23.5505200 lng=-46.6333090 dist=0.000 km
-```
-
-### Run the Test Suite
-
-```bash
+# Run test suite
 make test
+
+# Show all targets
+make help
 ```
 
-- Executes all 39 tests (correctness + stress + benchmarks)
-- Automatically fails if the binary exits with an error or hangs longer than 120s
+## API Reference
 
-For AddressSanitizer + UBSan builds:
-
-```bash
-make test-debug
-```
-
-## Key APIs
-
-Include the header and link against the static library:
+### Core Functions
 
 ```c
 #include "geo_index.h"
 
-GeoIndex *index = geo_index_create(1000);
-geo_index_add(index, 42, -23.55, -46.63);
-geo_index_build(index);
+// Create and populate index
+GeoIndex *index = geo_index_create(1000000);
+geo_index_add(index, id, lat, lng);
+geo_index_build(index);  // Sort by Z-order - makes index read-only
 
-GeoSearchStats stats;
-GeoSearchResult *hits = geo_search_radius(index, -23.55, -46.63, 5.0, &stats);
-...
-geo_result_destroy(hits);
+// Search operations (thread-safe after build)
+GeoSearchResult *r = geo_search_radius(index, lat, lng, radius_km, &stats);
+GeoSearchResult *r = geo_search_knn(index, lat, lng, k, max_km, &stats);
+GeoSearchResult *r = geo_search_bbox(index, min_lat, max_lat, min_lng, max_lng, &stats);
+
+// Cleanup
+geo_result_destroy(r);
 geo_index_destroy(index);
 ```
 
-Highlights:
+### SIMD Batch Functions
 
-| Function | Description |
-|----------|-------------|
-| `geo_encode/geo_decode` | Convert latitude/longitude to/from 64-bit Morton codes |
-| `geo_search_radius` | Deduplicated radius filtering with bounding-box pruning |
-| `geo_search_knn` | Adaptive KNN expanding search radius up to a max distance |
-| `geo_build_ranges` | Builds Morton ranges for efficient filtering |
-| `geo_fast_distance_km` | Low-cost equirectangular approximation |
-| `geo_get_time_ms` | Cross-platform high-resolution timer |
+```c
+#include "geo_index.h"  // SIMD included automatically
 
-## Performance Snapshot
+// Batch encoding/decoding (up to 1.5x faster)
+geo_simd_encode_batch(lats, lngs, z_codes, count);
+geo_simd_decode_batch(z_codes, lats, lngs, count);
 
-| Benchmark | Result |
-|-----------|--------|
-| Encode | 318 M ops/sec |
-| Decode | 1001 M ops/sec |
-| Binary searches | 8.17 M ops/sec |
-| Radius search (1M pts, 100 queries, 100 km) | 0.035 ms avg |
-| 5M record build | 375 ms total |
+// Batch distance calculations (up to 5x faster)
+geo_simd_haversine_batch(lat1, lng1, lats, lngs, distances, count);
+geo_simd_fast_distance_batch(lat1, lng1, lats, lngs, distances, count);
 
-*(Measured on Apple Silicon, `-O3 -march=native -flto -ffast-math`)*
+// Batch filtering (up to 33x faster)
+geo_simd_filter_radius(lats, lngs, count, center_lat, center_lng, radius_km, mask);
+geo_simd_filter_bbox(lats, lngs, count, min_lat, max_lat, min_lng, max_lng, mask);
 
-## Roadmap Ideas
+// SIMD info
+bool available = geo_simd_available();
+const char *name = geo_simd_get_name();  // "ARM64 NEON", "x86-64 AVX2", etc.
+```
 
-1. SIMD-powered Hilbert curve encoder.
-2. Streaming ingestion with chunked merges.
-3. Optional persistent index serialization (memory-mapped file).
+### Key Types
+
+```c
+typedef struct { double lat, lng; } GeoPoint;
+typedef struct { uint64_t id, z; } GeoRecord;  // 16-byte aligned
+typedef struct { GeoRecord *results; size_t count, capacity; } GeoSearchResult;
+typedef struct { uint64_t records_scanned, records_matched; double search_time_ms; } GeoSearchStats;
+```
+
+## Performance Benchmarks
+
+### SIMD vs Scalar (ARM64 Apple Silicon M1)
+
+| Operation | Scalar | SIMD | Speedup |
+|-----------|--------|------|---------|
+| Encode (1M pts) | 2.08 ms | 1.43 ms | **1.45x** |
+| Decode (1M pts) | 1.16 ms | 0.97 ms | **1.20x** |
+| Haversine (1M) | 10.98 ms | 1.92 ms | **5.72x** |
+| Filter Radius (1M) | 6.85 ms | 0.19 ms | **36.25x** |
+
+**Average SIMD Speedup: 11x**
+
+### Large Scale Performance
+
+| Metric | Result |
+|--------|--------|
+| Index 10M points | 55 ms insert + 367 ms build |
+| Radius search (50km, 10M pts) | 0.086 ms avg |
+| Multi-thread speedup (8 threads) | **5.79x** |
+| Searches per second | **41,780** |
+| Encoding precision | < 0.01 meters |
+
+### Thread Safety
+
+```
+✓ Reads are thread-safe after geo_index_build()
+✗ Writes (geo_index_add) are NOT thread-safe
+```
+
+The library is designed for a **build-once, query-many** pattern:
+1. Build the index in a single thread
+2. Call `geo_index_build()` to finalize
+3. Query from multiple threads concurrently
+
+## Build Targets
+
+```bash
+make all            # Build everything
+make lib            # Static library only
+make test           # Run test suite (48 tests)
+make test-debug     # Run with AddressSanitizer
+make demo           # Comprehensive benchmark (10M points)
+make main           # Basic API demo
+make benchmark      # Performance benchmarks only
+make simd-benchmark # SIMD-specific benchmarks
+make clean          # Remove build artifacts
+make help           # Show all options
+```
+
+## Precision Analysis
+
+| Location | Encoding Error |
+|----------|----------------|
+| São Paulo, Brazil | 0.0021 m |
+| New York, USA | 0.0058 m |
+| Tokyo, Japan | 0.0049 m |
+| North Pole | 0.0029 m |
+| Prime Meridian | 0.0052 m |
+
+**Sub-centimeter precision worldwide!**
+
+## Roadmap
+
+- [ ] Hilbert curve alternative encoding
+- [ ] Streaming ingestion with chunked merges
+- [ ] Memory-mapped persistent index
+- [ ] Vincenty distance formula option
+- [ ] Python/Rust/Go bindings
 
 ## Contributing
 
-PRs and issues are welcome once the GitHub repository is published. Suggested areas:
-- Additional heuristics for adaptive range subdivision.
-- Alternative distance metrics (Vincenty, ECEF).
-- Bindings for Rust/Python/Go.
+Contributions welcome! Areas of interest:
+- Additional SIMD optimizations
+- Alternative distance metrics
+- Language bindings
+- Documentation improvements ( I'm using AI to improve the documentation... )

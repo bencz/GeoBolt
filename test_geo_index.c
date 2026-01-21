@@ -8,6 +8,39 @@
 #include <assert.h>
 
 // =========================================================
+// Benchmark Timing Utilities
+// =========================================================
+
+typedef struct {
+    double start_time;
+    double end_time;
+    double elapsed_ms;
+    const char *name;
+} BenchmarkTimer;
+
+static inline void benchmark_start(BenchmarkTimer *timer, const char *name) {
+    timer->name = name;
+    timer->start_time = geo_get_time_ms();
+}
+
+static inline void benchmark_end(BenchmarkTimer *timer) {
+    timer->end_time = geo_get_time_ms();
+    timer->elapsed_ms = timer->end_time - timer->start_time;
+}
+
+__attribute__((unused))
+static inline void benchmark_print(const BenchmarkTimer *timer) {
+    printf("    [TIMER] %s: %.3f ms\n", timer->name, timer->elapsed_ms);
+}
+
+__attribute__((unused))
+static inline void benchmark_print_ops(const BenchmarkTimer *timer, size_t ops) {
+    double ops_per_sec = (ops / timer->elapsed_ms) * 1000.0;
+    printf("    [TIMER] %s: %.3f ms (%.2f M ops/sec)\n", 
+           timer->name, timer->elapsed_ms, ops_per_sec / 1000000.0);
+}
+
+// =========================================================
 // Test Framework
 // =========================================================
 
@@ -39,11 +72,16 @@ static int g_tests_failed = 0;
 
 #define RUN_TEST(test_func) do { \
     g_tests_run++; \
+    BenchmarkTimer _test_timer; \
+    benchmark_start(&_test_timer, #test_func); \
     printf("\n[TEST %d] %s\n", g_tests_run, #test_func); \
-    if (test_func()) { \
-        printf("  %s\n", TEST_PASSED); \
+    int _result = test_func(); \
+    benchmark_end(&_test_timer); \
+    if (_result) { \
+        printf("  %s (%.3f ms)\n", TEST_PASSED, _test_timer.elapsed_ms); \
         g_tests_passed++; \
     } else { \
+        printf("  (%.3f ms)\n", _test_timer.elapsed_ms); \
         g_tests_failed++; \
     } \
 } while(0)
@@ -667,27 +705,62 @@ int test_stress_large_dataset(void) {
     int n = 5000000;
     printf("    Creating index with %d records...\n", n);
     
+    // Allocate arrays for batch operations
+    double *lats = (double*)malloc(n * sizeof(double));
+    double *lngs = (double*)malloc(n * sizeof(double));
+    uint64_t *ids = (uint64_t*)malloc(n * sizeof(uint64_t));
+    
+    ASSERT_TRUE(lats && lngs && ids, "failed to allocate arrays");
+    
+    // Generate random data
+    srand(42);
+    for (int i = 0; i < n; i++) {
+        lats[i] = ((double)rand() / RAND_MAX) * 180.0 - 90.0;
+        lngs[i] = ((double)rand() / RAND_MAX) * 360.0 - 180.0;
+        ids[i] = i;
+    }
+    
+    // === SCALAR INSERT ===
     GeoIndex *index = geo_index_create(n);
     ASSERT_TRUE(index != NULL, "failed to create large index");
     
-    srand(42);
     double start = geo_get_time_ms();
-    
     for (int i = 0; i < n; i++) {
-        double lat = ((double)rand() / RAND_MAX) * 180.0 - 90.0;
-        double lng = ((double)rand() / RAND_MAX) * 360.0 - 180.0;
-        geo_index_add(index, i, lat, lng);
+        geo_index_add(index, ids[i], lats[i], lngs[i]);
     }
-    
-    double insert_time = geo_get_time_ms() - start;
-    printf("    Insert time: %.2f ms (%.2f M ops/sec)\n",
-           insert_time, n / insert_time / 1000.0);
+    double scalar_insert_time = geo_get_time_ms() - start;
     
     start = geo_get_time_ms();
     geo_index_build(index);
     double build_time = geo_get_time_ms() - start;
-    printf("    Build time: %.2f ms\n", build_time);
     
+    printf("    ┌─────────────────────────────────────────────────────────┐\n");
+    printf("    │ LARGE DATASET TEST (%d records)                    │\n", n);
+    printf("    ├─────────────────────────────────────────────────────────┤\n");
+    printf("    │ Scalar Insert: %8.2f ms (%6.2f M ops/sec)           │\n",
+           scalar_insert_time, n / scalar_insert_time / 1000.0);
+    
+#if GEO_SIMD_ENABLED
+    // === SIMD ENCODE ===
+    uint64_t *z_codes = (uint64_t*)malloc(n * sizeof(uint64_t));
+    ASSERT_TRUE(z_codes != NULL, "failed to allocate z_codes");
+    
+    start = geo_get_time_ms();
+    geo_simd_encode_batch(lats, lngs, z_codes, n);
+    double simd_encode_time = geo_get_time_ms() - start;
+    
+    printf("    │ SIMD Encode:   %8.2f ms (%6.2f M ops/sec)           │\n",
+           simd_encode_time, n / simd_encode_time / 1000.0);
+    printf("    │ Encode Speedup: %6.2fx                                 │\n",
+           scalar_insert_time / simd_encode_time);
+    
+    free(z_codes);
+#endif
+    
+    printf("    │ Build time:    %8.2f ms                              │\n", build_time);
+    printf("    ├─────────────────────────────────────────────────────────┤\n");
+    
+    // === SEARCH TESTS ===
     int num_searches = 1000;
     double total_search_time = 0;
     
@@ -702,67 +775,167 @@ int test_stress_large_dataset(void) {
         geo_result_destroy(result);
     }
     
-    printf("    Avg search time (50km radius): %.3f ms\n", total_search_time / num_searches);
+    printf("    │ Avg search (50km): %.3f ms                            │\n", 
+           total_search_time / num_searches);
+    printf("    └─────────────────────────────────────────────────────────┘\n");
     
     geo_index_destroy(index);
+    free(lats);
+    free(lngs);
+    free(ids);
     return 1;
 }
 
 int test_stress_many_searches(void) {
     int n = 100000;
-    GeoIndex *index = geo_index_create(n);
+    
+    // Allocate arrays
+    double *lats = (double*)malloc(n * sizeof(double));
+    double *lngs = (double*)malloc(n * sizeof(double));
     
     srand(42);
     for (int i = 0; i < n; i++) {
-        double lat = ((double)rand() / RAND_MAX) * 180.0 - 90.0;
-        double lng = ((double)rand() / RAND_MAX) * 360.0 - 180.0;
-        geo_index_add(index, i, lat, lng);
+        lats[i] = ((double)rand() / RAND_MAX) * 180.0 - 90.0;
+        lngs[i] = ((double)rand() / RAND_MAX) * 360.0 - 180.0;
+    }
+    
+    GeoIndex *index = geo_index_create(n);
+    for (int i = 0; i < n; i++) {
+        geo_index_add(index, i, lats[i], lngs[i]);
     }
     geo_index_build(index);
     
     int num_searches = 10000;
-    double start = geo_get_time_ms();
+    
+    // Generate search points
+    double *search_lats = (double*)malloc(num_searches * sizeof(double));
+    double *search_lngs = (double*)malloc(num_searches * sizeof(double));
     
     srand(123);
     for (int i = 0; i < num_searches; i++) {
-        double lat = ((double)rand() / RAND_MAX) * 180.0 - 90.0;
-        double lng = ((double)rand() / RAND_MAX) * 360.0 - 180.0;
-        
-        GeoSearchResult *result = geo_search_radius(index, lat, lng, 100.0, NULL);
-        geo_result_destroy(result);
+        search_lats[i] = ((double)rand() / RAND_MAX) * 180.0 - 90.0;
+        search_lngs[i] = ((double)rand() / RAND_MAX) * 360.0 - 180.0;
     }
     
-    double elapsed = geo_get_time_ms() - start;
-    printf("    %d searches in %.2f ms (%.2f searches/sec)\n",
-           num_searches, elapsed, num_searches / elapsed * 1000.0);
+    // === SCALAR SEARCH ===
+    double start = geo_get_time_ms();
+    for (int i = 0; i < num_searches; i++) {
+        GeoSearchResult *result = geo_search_radius(index, search_lats[i], search_lngs[i], 100.0, NULL);
+        geo_result_destroy(result);
+    }
+    double scalar_time = geo_get_time_ms() - start;
+    
+    printf("    ┌─────────────────────────────────────────────────────────┐\n");
+    printf("    │ MANY SEARCHES TEST (%d searches)                     │\n", num_searches);
+    printf("    ├─────────────────────────────────────────────────────────┤\n");
+    printf("    │ Scalar Search: %8.2f ms (%8.0f searches/sec)      │\n",
+           scalar_time, num_searches / scalar_time * 1000.0);
+    
+#if GEO_SIMD_ENABLED
+    // === SIMD HAVERSINE BATCH ===
+    double *dists = (double*)malloc(n * sizeof(double));
+    
+    start = geo_get_time_ms();
+    for (int i = 0; i < num_searches; i++) {
+        geo_simd_haversine_batch(search_lats[i], search_lngs[i], lats, lngs, dists, n);
+    }
+    double simd_dist_time = geo_get_time_ms() - start;
+    
+    printf("    │ SIMD Distance: %8.2f ms (%8.0f batches/sec)       │\n",
+           simd_dist_time, num_searches / simd_dist_time * 1000.0);
+    printf("    │ Distance Speedup: %5.2fx                               │\n",
+           scalar_time / simd_dist_time);
+    
+    free(dists);
+#endif
+    
+    printf("    └─────────────────────────────────────────────────────────┘\n");
     
     geo_index_destroy(index);
+    free(lats);
+    free(lngs);
+    free(search_lats);
+    free(search_lngs);
     return 1;
 }
 
 int test_stress_dense_area(void) {
     int n = 100000;
-    GeoIndex *index = geo_index_create(n);
     
     double center_lat = -23.5505;
     double center_lng = -46.6333;
+    double radius_km = 5.0;
+    
+    // Allocate arrays
+    double *lats = (double*)malloc(n * sizeof(double));
+    double *lngs = (double*)malloc(n * sizeof(double));
     
     srand(42);
     for (int i = 0; i < n; i++) {
-        double lat = center_lat + ((double)rand() / RAND_MAX - 0.5) * 0.1;
-        double lng = center_lng + ((double)rand() / RAND_MAX - 0.5) * 0.1;
-        geo_index_add(index, i, lat, lng);
+        lats[i] = center_lat + ((double)rand() / RAND_MAX - 0.5) * 0.1;
+        lngs[i] = center_lng + ((double)rand() / RAND_MAX - 0.5) * 0.1;
+    }
+    
+    GeoIndex *index = geo_index_create(n);
+    for (int i = 0; i < n; i++) {
+        geo_index_add(index, i, lats[i], lngs[i]);
     }
     geo_index_build(index);
     
+    // === SCALAR SEARCH ===
     GeoSearchStats stats;
-    GeoSearchResult *result = geo_search_radius(index, center_lat, center_lng, 5.0, &stats);
-    
-    printf("    Dense area: found %zu of %d in %.3f ms\n",
-           result->count, n, stats.search_time_ms);
-    
+    double start = geo_get_time_ms();
+    GeoSearchResult *result = geo_search_radius(index, center_lat, center_lng, radius_km, &stats);
+    double scalar_time = geo_get_time_ms() - start;
+    size_t scalar_count = result->count;
     geo_result_destroy(result);
+    
+    printf("    ┌─────────────────────────────────────────────────────────┐\n");
+    printf("    │ DENSE AREA TEST (%d points, %.1fkm radius)           │\n", n, radius_km);
+    printf("    ├─────────────────────────────────────────────────────────┤\n");
+    printf("    │ Scalar Search: %8.3f ms, found %zu points           │\n",
+           scalar_time, scalar_count);
+    
+#if GEO_SIMD_ENABLED
+    // === SIMD FILTER RADIUS ===
+    uint8_t *mask = (uint8_t*)malloc(n * sizeof(uint8_t));
+    
+    start = geo_get_time_ms();
+    size_t simd_count = geo_simd_filter_radius(lats, lngs, n, center_lat, center_lng, radius_km, mask);
+    double simd_time = geo_get_time_ms() - start;
+    
+    printf("    │ SIMD Filter:   %8.3f ms, found %zu points           │\n",
+           simd_time, simd_count);
+    printf("    │ Filter Speedup: %6.2fx                                 │\n",
+           scalar_time / simd_time);
+    
+    // === SIMD HAVERSINE BATCH ===
+    double *dists = (double*)malloc(n * sizeof(double));
+    
+    start = geo_get_time_ms();
+    geo_simd_haversine_batch(center_lat, center_lng, lats, lngs, dists, n);
+    double haversine_time = geo_get_time_ms() - start;
+    
+    // Count matches
+    size_t haversine_count = 0;
+    for (int i = 0; i < n; i++) {
+        if (dists[i] <= radius_km) haversine_count++;
+    }
+    
+    printf("    │ SIMD Haversine: %7.3f ms, found %zu points           │\n",
+           haversine_time, haversine_count);
+    printf("    │ Haversine Speedup: %5.2fx                              │\n",
+           scalar_time / haversine_time);
+    
+    free(mask);
+    free(dists);
+#endif
+    
+    printf("    └─────────────────────────────────────────────────────────┘\n");
+    
     geo_index_destroy(index);
+    free(lats);
+    free(lngs);
     return 1;
 }
 
@@ -871,6 +1044,277 @@ int test_validation_wrap_lng(void) {
 }
 
 // =========================================================
+// SIMD Benchmark Tests
+// =========================================================
+
+#if GEO_SIMD_ENABLED
+
+int test_simd_available(void) {
+    bool available = geo_simd_available();
+    const char *name = geo_simd_get_name();
+    size_t batch_size = geo_simd_optimal_batch_size();
+    
+    printf("    SIMD Available: %s\n", available ? "YES" : "NO");
+    printf("    SIMD Implementation: %s\n", name);
+    printf("    Optimal Batch Size: %zu\n", batch_size);
+    
+    return 1;
+}
+
+int test_simd_encode_correctness(void) {
+    size_t count = 1000;
+    double *lats = (double*)malloc(count * sizeof(double));
+    double *lngs = (double*)malloc(count * sizeof(double));
+    uint64_t *z_scalar = (uint64_t*)malloc(count * sizeof(uint64_t));
+    uint64_t *z_simd = (uint64_t*)malloc(count * sizeof(uint64_t));
+    
+    if (!lats || !lngs || !z_scalar || !z_simd) {
+        free(lats); free(lngs); free(z_scalar); free(z_simd);
+        return 0;
+    }
+    
+    // Generate test data
+    for (size_t i = 0; i < count; i++) {
+        lats[i] = ((double)(i % 18000) / 100.0) - 90.0;
+        lngs[i] = ((double)(i % 36000) / 100.0) - 180.0;
+    }
+    
+    // Scalar encoding
+    for (size_t i = 0; i < count; i++) {
+        z_scalar[i] = geo_encode(lats[i], lngs[i]);
+    }
+    
+    // SIMD encoding
+    geo_simd_encode_batch(lats, lngs, z_simd, count);
+    
+    // Compare results
+    int mismatches = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (z_scalar[i] != z_simd[i]) {
+            mismatches++;
+            if (mismatches <= 3) {
+                printf("    Mismatch at %zu: scalar=%" PRIu64 " simd=%" PRIu64 "\n",
+                       i, z_scalar[i], z_simd[i]);
+            }
+        }
+    }
+    
+    printf("    Compared %zu encodings, %d mismatches\n", count, mismatches);
+    
+    free(lats); free(lngs); free(z_scalar); free(z_simd);
+    return mismatches == 0;
+}
+
+int test_simd_decode_correctness(void) {
+    size_t count = 1000;
+    uint64_t *z_codes = (uint64_t*)malloc(count * sizeof(uint64_t));
+    double *lats_scalar = (double*)malloc(count * sizeof(double));
+    double *lngs_scalar = (double*)malloc(count * sizeof(double));
+    double *lats_simd = (double*)malloc(count * sizeof(double));
+    double *lngs_simd = (double*)malloc(count * sizeof(double));
+    
+    if (!z_codes || !lats_scalar || !lngs_scalar || !lats_simd || !lngs_simd) {
+        free(z_codes); free(lats_scalar); free(lngs_scalar);
+        free(lats_simd); free(lngs_simd);
+        return 0;
+    }
+    
+    // Generate test data
+    for (size_t i = 0; i < count; i++) {
+        double lat = ((double)(i % 18000) / 100.0) - 90.0;
+        double lng = ((double)(i % 36000) / 100.0) - 180.0;
+        z_codes[i] = geo_encode(lat, lng);
+    }
+    
+    // Scalar decoding
+    for (size_t i = 0; i < count; i++) {
+        GeoPoint p = geo_decode(z_codes[i]);
+        lats_scalar[i] = p.lat;
+        lngs_scalar[i] = p.lng;
+    }
+    
+    // SIMD decoding
+    geo_simd_decode_batch(z_codes, lats_simd, lngs_simd, count);
+    
+    // Compare results
+    double max_lat_diff = 0, max_lng_diff = 0;
+    for (size_t i = 0; i < count; i++) {
+        double lat_diff = fabs(lats_scalar[i] - lats_simd[i]);
+        double lng_diff = fabs(lngs_scalar[i] - lngs_simd[i]);
+        if (lat_diff > max_lat_diff) max_lat_diff = lat_diff;
+        if (lng_diff > max_lng_diff) max_lng_diff = lng_diff;
+    }
+    
+    printf("    Max lat diff: %.10f, max lng diff: %.10f\n", max_lat_diff, max_lng_diff);
+    
+    free(z_codes); free(lats_scalar); free(lngs_scalar);
+    free(lats_simd); free(lngs_simd);
+    
+    // Allow small precision differences due to SIMD approximations
+    return max_lat_diff < 0.0001 && max_lng_diff < 0.0001;
+}
+
+int test_simd_haversine_accuracy(void) {
+    size_t count = 100;
+    double *lats = (double*)malloc(count * sizeof(double));
+    double *lngs = (double*)malloc(count * sizeof(double));
+    double *dists_scalar = (double*)malloc(count * sizeof(double));
+    double *dists_simd = (double*)malloc(count * sizeof(double));
+    
+    if (!lats || !lngs || !dists_scalar || !dists_simd) {
+        free(lats); free(lngs); free(dists_scalar); free(dists_simd);
+        return 0;
+    }
+    
+    double center_lat = -23.5505;
+    double center_lng = -46.6333;
+    
+    // Generate test points
+    for (size_t i = 0; i < count; i++) {
+        lats[i] = center_lat + ((double)i / count - 0.5) * 10.0;
+        lngs[i] = center_lng + ((double)i / count - 0.5) * 10.0;
+    }
+    
+    // Scalar haversine
+    for (size_t i = 0; i < count; i++) {
+        dists_scalar[i] = geo_haversine_km(center_lat, center_lng, lats[i], lngs[i]);
+    }
+    
+    // SIMD haversine
+    geo_simd_haversine_batch(center_lat, center_lng, lats, lngs, dists_simd, count);
+    
+    // Compare results
+    double max_diff = 0, max_rel_error = 0;
+    for (size_t i = 0; i < count; i++) {
+        double diff = fabs(dists_scalar[i] - dists_simd[i]);
+        double rel_error = (dists_scalar[i] > 0.01) ? (diff / dists_scalar[i]) : 0;
+        if (diff > max_diff) max_diff = diff;
+        if (rel_error > max_rel_error) max_rel_error = rel_error;
+    }
+    
+    printf("    Max absolute diff: %.4f km\n", max_diff);
+    printf("    Max relative error: %.2f%%\n", max_rel_error * 100.0);
+    
+    free(lats); free(lngs); free(dists_scalar); free(dists_simd);
+    
+    // SIMD uses approximations, allow up to 5% error
+    return max_rel_error < 0.05;
+}
+
+int test_simd_benchmark_encode(void) {
+    printf("    Running SIMD encode benchmark...\n");
+    
+    GeoSimdBenchmark result = geo_simd_benchmark_encode(100000, 10);
+    
+    printf("    ┌─────────────────────────────────────────────────────────┐\n");
+    printf("    │ ENCODE BENCHMARK (100K points x 10 iterations)          │\n");
+    printf("    ├─────────────────────────────────────────────────────────┤\n");
+    printf("    │ Scalar:  %8.2f ms  (%6.2f M ops/sec)                 │\n",
+           result.scalar_time_ms, 
+           (result.operations / result.scalar_time_ms) / 1000.0);
+    printf("    │ SIMD:    %8.2f ms  (%6.2f M ops/sec)                 │\n",
+           result.simd_time_ms,
+           (result.operations / result.simd_time_ms) / 1000.0);
+    printf("    │ Speedup: %8.2fx                                      │\n", result.speedup);
+    printf("    └─────────────────────────────────────────────────────────┘\n");
+    
+    return 1;
+}
+
+int test_simd_benchmark_decode(void) {
+    printf("    Running SIMD decode benchmark...\n");
+    
+    GeoSimdBenchmark result = geo_simd_benchmark_decode(100000, 10);
+    
+    printf("    ┌─────────────────────────────────────────────────────────┐\n");
+    printf("    │ DECODE BENCHMARK (100K codes x 10 iterations)           │\n");
+    printf("    ├─────────────────────────────────────────────────────────┤\n");
+    printf("    │ Scalar:  %8.2f ms  (%6.2f M ops/sec)                 │\n",
+           result.scalar_time_ms, 
+           (result.operations / result.scalar_time_ms) / 1000.0);
+    printf("    │ SIMD:    %8.2f ms  (%6.2f M ops/sec)                 │\n",
+           result.simd_time_ms,
+           (result.operations / result.simd_time_ms) / 1000.0);
+    printf("    │ Speedup: %8.2fx                                      │\n", result.speedup);
+    printf("    └─────────────────────────────────────────────────────────┘\n");
+    
+    return 1;
+}
+
+int test_simd_benchmark_haversine(void) {
+    printf("    Running SIMD haversine benchmark...\n");
+    
+    GeoSimdBenchmark result = geo_simd_benchmark_haversine(100000, 10);
+    
+    printf("    ┌─────────────────────────────────────────────────────────┐\n");
+    printf("    │ HAVERSINE BENCHMARK (100K distances x 10 iterations)    │\n");
+    printf("    ├─────────────────────────────────────────────────────────┤\n");
+    printf("    │ Scalar:  %8.2f ms  (%6.2f M ops/sec)                 │\n",
+           result.scalar_time_ms, 
+           (result.operations / result.scalar_time_ms) / 1000.0);
+    printf("    │ SIMD:    %8.2f ms  (%6.2f M ops/sec)                 │\n",
+           result.simd_time_ms,
+           (result.operations / result.simd_time_ms) / 1000.0);
+    printf("    │ Speedup: %8.2fx                                      │\n", result.speedup);
+    printf("    └─────────────────────────────────────────────────────────┘\n");
+    
+    return 1;
+}
+
+int test_simd_benchmark_filter_radius(void) {
+    printf("    Running SIMD filter_radius benchmark...\n");
+    
+    GeoSimdBenchmark result = geo_simd_benchmark_filter_radius(100000, 5);
+    
+    printf("    ┌─────────────────────────────────────────────────────────┐\n");
+    printf("    │ FILTER RADIUS BENCHMARK (100K points x 5 iterations)    │\n");
+    printf("    ├─────────────────────────────────────────────────────────┤\n");
+    printf("    │ Scalar:  %8.2f ms  (%6.2f M ops/sec)                 │\n",
+           result.scalar_time_ms, 
+           (result.operations / result.scalar_time_ms) / 1000.0);
+    printf("    │ SIMD:    %8.2f ms  (%6.2f M ops/sec)                 │\n",
+           result.simd_time_ms,
+           (result.operations / result.simd_time_ms) / 1000.0);
+    printf("    │ Speedup: %8.2fx                                      │\n", result.speedup);
+    printf("    └─────────────────────────────────────────────────────────┘\n");
+    
+    return 1;
+}
+
+int test_simd_comprehensive_benchmark(void) {
+    printf("\n");
+    printf("    ╔═════════════════════════════════════════════════════════╗\n");
+    printf("    ║     COMPREHENSIVE SIMD vs SCALAR BENCHMARK SUMMARY      ║\n");
+    printf("    ╠═════════════════════════════════════════════════════════╣\n");
+    printf("    ║ Architecture: %-42s ║\n", geo_simd_get_name());
+    printf("    ╠═══════════════╦═══════════════╦═══════════════╦═════════╣\n");
+    printf("    ║   Operation   ║  Scalar (ms)  ║   SIMD (ms)   ║ Speedup ║\n");
+    printf("    ╠═══════════════╬═══════════════╬═══════════════╬═════════╣\n");
+    
+    GeoSimdBenchmark enc = geo_simd_benchmark_encode(50000, 20);
+    GeoSimdBenchmark dec = geo_simd_benchmark_decode(50000, 20);
+    GeoSimdBenchmark hav = geo_simd_benchmark_haversine(50000, 20);
+    GeoSimdBenchmark flt = geo_simd_benchmark_filter_radius(50000, 10);
+    
+    printf("    ║ Encode        ║ %13.2f ║ %13.2f ║ %6.2fx ║\n",
+           enc.scalar_time_ms, enc.simd_time_ms, enc.speedup);
+    printf("    ║ Decode        ║ %13.2f ║ %13.2f ║ %6.2fx ║\n",
+           dec.scalar_time_ms, dec.simd_time_ms, dec.speedup);
+    printf("    ║ Haversine     ║ %13.2f ║ %13.2f ║ %6.2fx ║\n",
+           hav.scalar_time_ms, hav.simd_time_ms, hav.speedup);
+    printf("    ║ Filter Radius ║ %13.2f ║ %13.2f ║ %6.2fx ║\n",
+           flt.scalar_time_ms, flt.simd_time_ms, flt.speedup);
+    printf("    ╚═══════════════╩═══════════════╩═══════════════╩═════════╝\n");
+    
+    double avg_speedup = (enc.speedup + dec.speedup + hav.speedup + flt.speedup) / 4.0;
+    printf("\n    Average Speedup: %.2fx\n", avg_speedup);
+    
+    return 1;
+}
+
+#endif // GEO_SIMD_ENABLED
+
+// =========================================================
 // Main
 // =========================================================
 
@@ -950,6 +1394,27 @@ int main(void) {
     RUN_TEST(test_stress_large_dataset);
     RUN_TEST(test_stress_many_searches);
     RUN_TEST(test_stress_dense_area);
+    
+#if GEO_SIMD_ENABLED
+    // SIMD Tests
+    printf("\n--- SIMD TESTS ---\n");
+    printf("SIMD Implementation: %s\n", geo_simd_get_name());
+    RUN_TEST(test_simd_available);
+    RUN_TEST(test_simd_encode_correctness);
+    RUN_TEST(test_simd_decode_correctness);
+    RUN_TEST(test_simd_haversine_accuracy);
+    
+    // SIMD Benchmarks
+    printf("\n--- SIMD BENCHMARKS (Scalar vs SIMD) ---\n");
+    RUN_TEST(test_simd_benchmark_encode);
+    RUN_TEST(test_simd_benchmark_decode);
+    RUN_TEST(test_simd_benchmark_haversine);
+    RUN_TEST(test_simd_benchmark_filter_radius);
+    RUN_TEST(test_simd_comprehensive_benchmark);
+#else
+    printf("\n--- SIMD TESTS ---\n");
+    printf("SIMD not available on this platform\n");
+#endif
     
     // Summary
     printf("\n========================================\n");
