@@ -94,7 +94,7 @@ typedef struct { uint64_t records_scanned, records_matched; double search_time_m
 
 ## Performance Benchmarks
 
-### SIMD vs Scalar (ARM64 Apple Silicon M1)
+### SIMD vs Scalar (ARM64 Apple Silicon M4 PRO)
 
 | Operation | Scalar | SIMD | Speedup |
 |-----------|--------|------|---------|
