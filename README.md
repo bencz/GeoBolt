@@ -8,7 +8,7 @@ for ARM64 (NEON) and x86-64 (AVX2/SSE), it provides sub-centimeter precision usi
 ## Features
 
 - **Sub-centimeter precision** – 32-bit per-axis normalization keeps errors under 1 cm
-- **⚡ SIMD Optimized** – ARM64 NEON and x86-64 AVX2/SSE implementations with 10x+ speedups
+- **SIMD Optimized** – ARM64 NEON and x86-64 AVX2/SSE implementations with 10x+ speedups
 - **Thread-safe reads** – Safe for concurrent search operations after index build
 - **Cache-friendly** – 16-byte aligned records with prefetch hints for maximum throughput
 - **Battle-tested** – 48 comprehensive tests covering correctness, stress, and performance
