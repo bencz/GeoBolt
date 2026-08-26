@@ -36,7 +36,12 @@ int main(void) {
     geo_index_add(index, 13, -23.4542000, -46.5333000);  // ~15km away
     geo_index_add(index, 14, -22.9068000, -43.1729000);  // Rio de Janeiro
 
-    geo_index_build(index);
+    if (!geo_index_build(index)) {
+        fprintf(stderr, "Failed to build the index\n");
+        geo_index_destroy(index);
+
+        return 1;
+    }
 
     double search_lat = -23.5505200;
     double search_lng = -46.6333090;

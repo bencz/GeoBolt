@@ -5,7 +5,7 @@
  * functions for geo-indexing operations. The actual implementations are
  * in separate files for each architecture:
  *   - geo_index_simd_arm64.c  (ARM64 NEON)
- *   - geo_index_simd_x86.c    (x86-64 AVX2/SSE4)
+ *   - geo_index_simd_x86.c    (x86-64 AVX-512/AVX2 with runtime dispatch)
  */
 
 #ifndef GEO_INDEX_SIMD_H
@@ -19,11 +19,15 @@
 extern "C" {
 #endif
 
+struct GeoRecord;
+
 // =========================================================
 // Architecture Detection
 // =========================================================
 
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(GEO_SIMD_FORCE_SCALAR)
+    // Explicitly use the portable backend, regardless of the target CPU.
+#elif defined(__aarch64__) || defined(_M_ARM64)
     #define GEO_SIMD_ARM64 1
     #define GEO_SIMD_ENABLED 1
     #define GEO_SIMD_NAME "ARM64 NEON"
@@ -84,6 +88,16 @@ extern "C" {
 void geo_simd_encode_batch(const double *lats, const double *lngs,
                            uint64_t *out_z, size_t count);
 
+// Encodes coordinates and interleaves application IDs directly into 16-byte records.
+void geo_simd_encode_records(const uint64_t *ids,
+                             const double *lats,
+                             const double *lngs,
+                             struct GeoRecord *out_records,
+                             size_t count);
+
+// Validates finite latitude/longitude bounds with the backend's narrow vector width.
+bool geo_simd_validate_points(const double *lats, const double *lngs, size_t count);
+
 /*
  * Batch decode Morton codes to lat/lng pairs using SIMD.
  * 
@@ -94,6 +108,27 @@ void geo_simd_encode_batch(const double *lats, const double *lngs,
  */
 void geo_simd_decode_batch(const uint64_t *z_codes,
                            double *out_lats, double *out_lngs, size_t count);
+
+// Uses the native narrow vector width to avoid AVX-512 to AVX2 transitions in mixed pipelines.
+void geo_simd_decode_batch_narrow(const uint64_t *z_codes,
+                                  double *out_lats,
+                                  double *out_lngs,
+                                  size_t count);
+
+// Extracts the second uint64_t from each interleaved { id, Morton code } pair.
+void geo_simd_extract_interleaved_codes(const struct GeoRecord *records,
+                                        uint64_t *out_codes,
+                                        size_t count);
+
+void geo_simd_extract_interleaved_codes_narrow(const struct GeoRecord *records,
+                                               uint64_t *out_codes,
+                                               size_t count);
+
+// Extracts and decodes Morton fields from interleaved records without a temporary code array.
+void geo_simd_decode_interleaved_records_narrow(const struct GeoRecord *records,
+                                                double *out_lats,
+                                                double *out_lngs,
+                                                size_t count);
 
 // =========================================================
 // SIMD Function Declarations - Distance Calculations
@@ -131,6 +166,26 @@ void geo_simd_fast_distance_batch(double lat1, double lng1,
 // SIMD Function Declarations - Range Filtering
 // =========================================================
 
+typedef struct {
+    double center_latitude_radians;
+    double center_longitude_radians;
+    double cosine_center_latitude;
+    double sine_angular_radius;
+    double haversine_limit;
+} GeoSimdRadiusQuery;
+
+void geo_simd_prepare_radius_query(double center_latitude,
+                                   double center_longitude,
+                                   double radius_km,
+                                   GeoSimdRadiusQuery *query);
+
+size_t geo_simd_filter_radius_prepared(const double *lats,
+                                       const double *lngs,
+                                       size_t count,
+                                       const GeoSimdRadiusQuery *query,
+                                       uint8_t *out_mask,
+                                       uint64_t *out_bits);
+
 /*
  * Filter Morton codes within a range using SIMD.
  * Returns indices of codes within [z_min, z_max].
@@ -156,7 +211,7 @@ size_t geo_simd_filter_range(const uint64_t *z_codes, size_t count,
  * @param max_lat    Maximum latitude
  * @param min_lng    Minimum longitude
  * @param max_lng    Maximum longitude
- * @param out_mask   Output bitmask (1 = inside, 0 = outside)
+ * @param out_mask   Optional output byte mask (1 = inside, 0 = outside); may be NULL for count-only filtering
  * @return           Number of points inside
  */
 size_t geo_simd_filter_bbox(const double *lats, const double *lngs, size_t count,
@@ -174,12 +229,41 @@ size_t geo_simd_filter_bbox(const double *lats, const double *lngs, size_t count
  * @param center_lat Center latitude
  * @param center_lng Center longitude
  * @param radius_km  Radius in kilometers
- * @param out_mask   Output bitmask (1 = inside, 0 = outside)
+ * @param out_mask   Optional output byte mask (1 = inside, 0 = outside); may be NULL for count-only filtering
  * @return           Number of points inside radius
  */
 size_t geo_simd_filter_radius(const double *lats, const double *lngs, size_t count,
                               double center_lat, double center_lng, double radius_km,
                               uint8_t *out_mask);
+
+size_t geo_simd_filter_radius_bits(const double *lats,
+                                   const double *lngs,
+                                   size_t count,
+                                   double center_lat,
+                                   double center_lng,
+                                   double radius_km,
+                                   uint64_t *out_bits);
+
+/*
+ * Decode Morton codes and evaluate the predicate in one backend pass. These
+ * kernels avoid materializing temporary latitude and longitude arrays. The
+ * output mask may be NULL when only the match count is required.
+ */
+size_t geo_simd_filter_bbox_codes(const uint64_t *z_codes,
+                                  size_t count,
+                                  double min_lat,
+                                  double max_lat,
+                                  double min_lng,
+                                  double max_lng,
+                                  uint8_t *out_mask);
+
+size_t geo_simd_filter_bbox_codes_bits(const uint64_t *z_codes,
+                                       size_t count,
+                                       double min_lat,
+                                       double max_lat,
+                                       double min_lng,
+                                       double max_lng,
+                                       uint64_t *out_bits);
 
 // =========================================================
 // SIMD Function Declarations - Morton Code Utilities
@@ -205,6 +289,12 @@ void geo_simd_spread_bits_batch(const uint32_t *values, uint64_t *out, size_t co
  */
 void geo_simd_compact_bits_batch(const uint64_t *values, uint32_t *out, size_t count);
 
+// Clears candidate bits whose interleaved GeoRecord ID equals excluded_id and returns the remaining popcount.
+size_t geo_simd_exclude_id_bits(const struct GeoRecord *records,
+                                size_t count,
+                                uint64_t excluded_id,
+                                uint64_t *candidate_bits);
+
 // =========================================================
 // SIMD Utility Functions
 // =========================================================
@@ -217,7 +307,7 @@ bool geo_simd_available(void);
 /*
  * Get SIMD implementation name.
  */
-const char* geo_simd_get_name(void);
+const char *geo_simd_get_name(void);
 
 /*
  * Get optimal batch size for current SIMD implementation.

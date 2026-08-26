@@ -27,6 +27,9 @@
 #define NUM_THREADS       8          // Number of parallel search threads
 #define SEARCH_RADIUS_KM  50.0       // Search radius in km
 
+static volatile uint64_t g_demo_sink_u64;
+static volatile double g_demo_sink_double;
+
 // =========================================================
 // Thread Data Structure
 // =========================================================
@@ -163,10 +166,18 @@ static void demo_large_scale_indexing(double **out_lats, double **out_lngs,
     free(z_codes);
 #endif
     
-    // Build index (sort by Z-order)
-    printf("\n  Building index (Z-order sort)...\n");
+    // Build index with automatic worker selection.
+    printf("\n  Building index (parallel Z-order radix sort)...\n");
     double build_start = geo_get_time_ms();
-    geo_index_build(index);
+
+    if (!geo_index_build_parallel(index, 0)) {
+        fprintf(stderr, "Failed to build index\n");
+        geo_index_destroy(index);
+        free(lngs);
+        free(lats);
+        exit(1);
+    }
+
     double build_time = geo_get_time_ms() - build_start;
     
     print_metric("Build time:", build_time, "ms");
@@ -185,41 +196,54 @@ static void demo_large_scale_indexing(double **out_lats, double **out_lngs,
 // Demo 2: SIMD vs Scalar Performance
 // =========================================================
 
-static void demo_simd_comparison(const double *lats, const double *lngs) {
+static void demo_simd_comparison(const double *lats, const double *lngs)
+{
     print_header("DEMO 2: SIMD vs SCALAR PERFORMANCE");
-    
+
 #if GEO_SIMD_ENABLED
     printf("  SIMD Implementation: %s\n", geo_simd_get_name());
     printf("  Optimal batch size: %zu\n\n", geo_simd_optimal_batch_size());
-    
-    int test_size = 1000000;
-    int iterations = 5;
-    
-    // Allocate output arrays
-    uint64_t *z_codes = (uint64_t*)malloc(test_size * sizeof(uint64_t));
-    double *dists = (double*)malloc(test_size * sizeof(double));
-    uint8_t *mask = (uint8_t*)malloc(test_size * sizeof(uint8_t));
-    
-    double center_lat = -23.5505;
-    double center_lng = -46.6333;
-    double radius = 100.0;
-    
+
+    const size_t test_size = 1000000;
+    const int iterations = 5;
+    const double center_lat = -23.5505;
+    const double center_lng = -46.6333;
+    const double radius = 100.0;
+
+    uint64_t *z_codes = malloc(test_size * sizeof(*z_codes));
+    double *dists = malloc(test_size * sizeof(*dists));
+    uint8_t *mask = malloc(test_size * sizeof(*mask));
+
+    if (!z_codes || !dists || !mask) {
+        free(z_codes);
+        free(dists);
+        free(mask);
+
+        fprintf(stderr, "Failed to allocate SIMD benchmark buffers\n");
+
+        return;
+    }
+
     printf("  ┌────────────────────┬────────────────┬────────────────┬──────────┐\n");
     printf("  │     Operation      │  Scalar (ms)   │   SIMD (ms)    │ Speedup  │\n");
     printf("  ├────────────────────┼────────────────┼────────────────┼──────────┤\n");
     
-    // === ENCODE ===
-    double scalar_time = 0, simd_time = 0;
-    
-    for (int iter = 0; iter < iterations; iter++) {
+    double scalar_time = 0.0;
+    double simd_time = 0.0;
+
+    for (int iter = 0; iter < iterations; ++iter) {
         double start = geo_get_time_ms();
-        for (int i = 0; i < test_size; i++) {
+
+        for (size_t i = 0; i < test_size; ++i) {
             z_codes[i] = geo_encode(lats[i], lngs[i]);
         }
+
+        g_demo_sink_u64 ^= z_codes[test_size / 2] ^ z_codes[test_size - 1];
         scalar_time += geo_get_time_ms() - start;
         
         start = geo_get_time_ms();
         geo_simd_encode_batch(lats, lngs, z_codes, test_size);
+        g_demo_sink_u64 ^= z_codes[test_size / 2] ^ z_codes[test_size - 1];
         simd_time += geo_get_time_ms() - start;
     }
     
@@ -227,18 +251,22 @@ static void demo_simd_comparison(const double *lats, const double *lngs) {
            scalar_time / iterations, simd_time / iterations, 
            scalar_time / simd_time);
     
-    // === HAVERSINE ===
-    scalar_time = simd_time = 0;
-    
-    for (int iter = 0; iter < iterations; iter++) {
+    scalar_time = 0.0;
+    simd_time = 0.0;
+
+    for (int iter = 0; iter < iterations; ++iter) {
         double start = geo_get_time_ms();
-        for (int i = 0; i < test_size; i++) {
+
+        for (size_t i = 0; i < test_size; ++i) {
             dists[i] = geo_haversine_km(center_lat, center_lng, lats[i], lngs[i]);
         }
+
+        g_demo_sink_double += dists[test_size / 2] + dists[test_size - 1];
         scalar_time += geo_get_time_ms() - start;
         
         start = geo_get_time_ms();
         geo_simd_haversine_batch(center_lat, center_lng, lats, lngs, dists, test_size);
+        g_demo_sink_double += dists[test_size / 2] + dists[test_size - 1];
         simd_time += geo_get_time_ms() - start;
     }
     
@@ -246,21 +274,26 @@ static void demo_simd_comparison(const double *lats, const double *lngs) {
            scalar_time / iterations, simd_time / iterations,
            scalar_time / simd_time);
     
-    // === FILTER RADIUS ===
-    scalar_time = simd_time = 0;
-    
-    for (int iter = 0; iter < iterations; iter++) {
+    scalar_time = 0.0;
+    simd_time = 0.0;
+
+    for (int iter = 0; iter < iterations; ++iter) {
         double start = geo_get_time_ms();
         size_t count = 0;
-        for (int i = 0; i < test_size; i++) {
+
+        for (size_t i = 0; i < test_size; ++i) {
             double d = geo_haversine_km(center_lat, center_lng, lats[i], lngs[i]);
-            if (d <= radius) count++;
+
+            if (d <= radius) {
+                count++;
+            }
         }
+
+        g_demo_sink_u64 ^= count;
         scalar_time += geo_get_time_ms() - start;
-        (void)count;
         
         start = geo_get_time_ms();
-        geo_simd_filter_radius(lats, lngs, test_size, center_lat, center_lng, radius, mask);
+        g_demo_sink_u64 ^= geo_simd_filter_radius(lats, lngs, test_size, center_lat, center_lng, radius, mask);
         simd_time += geo_get_time_ms() - start;
     }
     
@@ -268,18 +301,22 @@ static void demo_simd_comparison(const double *lats, const double *lngs) {
            scalar_time / iterations, simd_time / iterations,
            scalar_time / simd_time);
     
-    // === FAST DISTANCE ===
-    scalar_time = simd_time = 0;
-    
-    for (int iter = 0; iter < iterations; iter++) {
+    scalar_time = 0.0;
+    simd_time = 0.0;
+
+    for (int iter = 0; iter < iterations; ++iter) {
         double start = geo_get_time_ms();
-        for (int i = 0; i < test_size; i++) {
+
+        for (size_t i = 0; i < test_size; ++i) {
             dists[i] = geo_fast_distance_km(center_lat, center_lng, lats[i], lngs[i]);
         }
+
+        g_demo_sink_double += dists[test_size / 2] + dists[test_size - 1];
         scalar_time += geo_get_time_ms() - start;
         
         start = geo_get_time_ms();
         geo_simd_fast_distance_batch(center_lat, center_lng, lats, lngs, dists, test_size);
+        g_demo_sink_double += dists[test_size / 2] + dists[test_size - 1];
         simd_time += geo_get_time_ms() - start;
     }
     
@@ -305,8 +342,8 @@ static void demo_multithreaded_search(const GeoIndex *index) {
     print_header("DEMO 3: MULTI-THREADED SEARCH (THREAD SAFETY)");
     
     printf("  Demonstrating thread-safe read operations...\n");
-    printf("  NOTE: Index is read-only after geo_index_build()\n");
-    printf("  Concurrent reads are safe, concurrent writes are NOT.\n\n");
+    printf("  NOTE: This index is not mutated after geo_index_build().\n");
+    printf("  Concurrent reads are safe when no thread mutates the index.\n\n");
     
     // Generate search points
     double *search_lats = (double*)malloc(NUM_SEARCHES * sizeof(double));
@@ -527,7 +564,7 @@ static void demo_precision(void) {
         );
         
         printf("  │ %-22s │ %23.4f │ %12" PRIu64 " │\n",
-               test_points[i].name, error_m, z % 1000000000000ULL);
+               test_points[i].name, error_m, z % UINT64_C(1000000000000));
     }
     
     printf("  └────────────────────────┴─────────────────────────┴──────────────┘\n");

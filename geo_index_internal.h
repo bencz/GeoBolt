@@ -9,8 +9,9 @@
 #ifndef GEO_INDEX_INTERNAL_H
 #define GEO_INDEX_INTERNAL_H
 
-#include <stdint.h>
 #include <math.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846264338327950288
@@ -38,6 +39,11 @@
 #define GEO_INTERNAL_LAT_DENORM_SCALE (GEO_INTERNAL_LAT_RANGE / GEO_INTERNAL_COORD_MAX)
 #define GEO_INTERNAL_LNG_DENORM_SCALE (GEO_INTERNAL_LNG_RANGE / GEO_INTERNAL_COORD_MAX)
 
+static inline size_t geo_internal_bit_word_count(size_t bit_count)
+{
+    return bit_count / 64U + (bit_count % 64U != 0);
+}
+
 // =========================================================
 // Morton Code Bit Manipulation (Inline)
 // =========================================================
@@ -47,14 +53,16 @@
  * Each bit is spread to occupy every other bit position.
  * Used for Morton/Z-order encoding.
  */
-static inline uint64_t geo_internal_spread_bits(uint32_t v) {
+static inline uint64_t geo_internal_spread_bits(uint32_t v)
+{
     uint64_t x = v;
+
     x = (x | (x << 32)) & 0x00000000FFFFFFFFULL;
     x = (x | (x << 16)) & 0x0000FFFF0000FFFFULL;
-    x = (x | (x << 8))  & 0x00FF00FF00FF00FFULL;
-    x = (x | (x << 4))  & 0x0F0F0F0F0F0F0F0FULL;
-    x = (x | (x << 2))  & 0x3333333333333333ULL;
-    x = (x | (x << 1))  & 0x5555555555555555ULL;
+    x = (x | (x << 8)) & 0x00FF00FF00FF00FFULL;
+    x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0FULL;
+    x = (x | (x << 2)) & 0x3333333333333333ULL;
+    x = (x | (x << 1)) & 0x5555555555555555ULL;
     return x;
 }
 
@@ -63,14 +71,16 @@ static inline uint64_t geo_internal_spread_bits(uint32_t v) {
  * Extracts bits at every other position.
  * Used for Morton/Z-order decoding.
  */
-static inline uint32_t geo_internal_compact_bits(uint64_t v) {
+static inline uint32_t geo_internal_compact_bits(uint64_t v)
+{
     uint64_t x = v & 0x5555555555555555ULL;
-    x = (x | (x >> 1))  & 0x3333333333333333ULL;
-    x = (x | (x >> 2))  & 0x0F0F0F0F0F0F0F0FULL;
-    x = (x | (x >> 4))  & 0x00FF00FF00FF00FFULL;
-    x = (x | (x >> 8))  & 0x0000FFFF0000FFFFULL;
+
+    x = (x | (x >> 1)) & 0x3333333333333333ULL;
+    x = (x | (x >> 2)) & 0x0F0F0F0F0F0F0F0FULL;
+    x = (x | (x >> 4)) & 0x00FF00FF00FF00FFULL;
+    x = (x | (x >> 8)) & 0x0000FFFF0000FFFFULL;
     x = (x | (x >> 16)) & 0x00000000FFFFFFFFULL;
-    return (uint32_t)x;
+    return (uint32_t) x;
 }
 
 // =========================================================
@@ -80,35 +90,156 @@ static inline uint32_t geo_internal_compact_bits(uint64_t v) {
 /*
  * Normalize latitude to [0, UINT32_MAX] range.
  */
-static inline uint32_t geo_internal_normalize_lat(double lat) {
-    if (lat < -90.0) lat = -90.0;
-    if (lat > 90.0) lat = 90.0;
+static inline uint32_t geo_internal_normalize_lat(double lat)
+{
+    if (lat < -90.0) {
+        lat = -90.0;
+    }
+
+    if (lat > 90.0) {
+        lat = 90.0;
+    }
+
     double normalized = (lat + GEO_INTERNAL_LAT_OFFSET) * GEO_INTERNAL_LAT_SCALE;
-    return (uint32_t)normalized;
+
+    return (uint32_t) normalized;
 }
 
 /*
  * Normalize longitude to [0, UINT32_MAX] range.
  */
-static inline uint32_t geo_internal_normalize_lng(double lng) {
-    if (lng < -180.0) lng = -180.0;
-    if (lng > 180.0) lng = 180.0;
+static inline uint32_t geo_internal_normalize_lng(double lng)
+{
+    if (lng < -180.0) {
+        lng = -180.0;
+    }
+
+    if (lng > 180.0) {
+        lng = 180.0;
+    }
+
     double normalized = (lng + GEO_INTERNAL_LNG_OFFSET) * GEO_INTERNAL_LNG_SCALE;
-    return (uint32_t)normalized;
+
+    return (uint32_t) normalized;
 }
 
 /*
  * Denormalize uint32 to latitude.
  */
-static inline double geo_internal_denormalize_lat(uint32_t v) {
-    return ((double)v * GEO_INTERNAL_LAT_DENORM_SCALE) - GEO_INTERNAL_LAT_OFFSET;
+static inline double geo_internal_denormalize_lat(uint32_t v)
+{
+    return ((double) v * GEO_INTERNAL_LAT_DENORM_SCALE) - GEO_INTERNAL_LAT_OFFSET;
 }
 
 /*
  * Denormalize uint32 to longitude.
  */
-static inline double geo_internal_denormalize_lng(uint32_t v) {
-    return ((double)v * GEO_INTERNAL_LNG_DENORM_SCALE) - GEO_INTERNAL_LNG_OFFSET;
+static inline double geo_internal_denormalize_lng(uint32_t v)
+{
+    return ((double) v * GEO_INTERNAL_LNG_DENORM_SCALE) - GEO_INTERNAL_LNG_OFFSET;
+}
+
+// Inclusive integer thresholds equivalent to comparisons against decoded coordinates.
+// The correction loops handle the rare floating-point boundary where projection and
+// denormalization round in opposite directions.
+static inline uint32_t geo_internal_normalized_lower(double coordinate,
+                                                     double minimum,
+                                                     double maximum,
+                                                     double offset,
+                                                     double scale,
+                                                     double denormalization_scale)
+{
+    if (coordinate <= minimum) {
+        return 0;
+    }
+
+    if (coordinate >= maximum) {
+        return UINT32_MAX;
+    }
+
+    uint32_t threshold = (uint32_t) ((coordinate + offset) * scale);
+
+    while (threshold < UINT32_MAX &&
+           (double) threshold * denormalization_scale - offset < coordinate) {
+        threshold++;
+    }
+
+    while (threshold > 0 &&
+           (double) (threshold - 1) * denormalization_scale - offset >= coordinate) {
+        threshold--;
+    }
+
+    return threshold;
+}
+
+static inline uint32_t geo_internal_normalized_upper(double coordinate,
+                                                     double minimum,
+                                                     double maximum,
+                                                     double offset,
+                                                     double scale,
+                                                     double denormalization_scale)
+{
+    if (coordinate <= minimum) {
+        return 0;
+    }
+
+    if (coordinate >= maximum) {
+        return UINT32_MAX;
+    }
+
+    uint32_t threshold = (uint32_t) ((coordinate + offset) * scale);
+
+    while (threshold > 0 &&
+           (double) threshold * denormalization_scale - offset > coordinate) {
+        threshold--;
+    }
+
+    while (threshold < UINT32_MAX &&
+           (double) (threshold + 1) * denormalization_scale - offset <= coordinate) {
+        threshold++;
+    }
+
+    return threshold;
+}
+
+static inline uint32_t geo_internal_normalized_lat_lower(double latitude)
+{
+    return geo_internal_normalized_lower(latitude,
+                                         -90.0,
+                                         90.0,
+                                         GEO_INTERNAL_LAT_OFFSET,
+                                         GEO_INTERNAL_LAT_SCALE,
+                                         GEO_INTERNAL_LAT_DENORM_SCALE);
+}
+
+static inline uint32_t geo_internal_normalized_lat_upper(double latitude)
+{
+    return geo_internal_normalized_upper(latitude,
+                                         -90.0,
+                                         90.0,
+                                         GEO_INTERNAL_LAT_OFFSET,
+                                         GEO_INTERNAL_LAT_SCALE,
+                                         GEO_INTERNAL_LAT_DENORM_SCALE);
+}
+
+static inline uint32_t geo_internal_normalized_lng_lower(double longitude)
+{
+    return geo_internal_normalized_lower(longitude,
+                                         -180.0,
+                                         180.0,
+                                         GEO_INTERNAL_LNG_OFFSET,
+                                         GEO_INTERNAL_LNG_SCALE,
+                                         GEO_INTERNAL_LNG_DENORM_SCALE);
+}
+
+static inline uint32_t geo_internal_normalized_lng_upper(double longitude)
+{
+    return geo_internal_normalized_upper(longitude,
+                                         -180.0,
+                                         180.0,
+                                         GEO_INTERNAL_LNG_OFFSET,
+                                         GEO_INTERNAL_LNG_SCALE,
+                                         GEO_INTERNAL_LNG_DENORM_SCALE);
 }
 
 // =========================================================
@@ -118,16 +249,19 @@ static inline double geo_internal_denormalize_lng(uint32_t v) {
 /*
  * Encode lat/lng to Morton code.
  */
-static inline uint64_t geo_internal_encode(double lat, double lng) {
+static inline uint64_t geo_internal_encode(double lat, double lng)
+{
     uint32_t lat_norm = geo_internal_normalize_lat(lat);
     uint32_t lng_norm = geo_internal_normalize_lng(lng);
+
     return geo_internal_spread_bits(lat_norm) | (geo_internal_spread_bits(lng_norm) << 1);
 }
 
 /*
  * Decode Morton code to lat/lng.
  */
-static inline void geo_internal_decode(uint64_t z, double *out_lat, double *out_lng) {
+static inline void geo_internal_decode(uint64_t z, double *out_lat, double *out_lng)
+{
     *out_lat = geo_internal_denormalize_lat(geo_internal_compact_bits(z));
     *out_lng = geo_internal_denormalize_lng(geo_internal_compact_bits(z >> 1));
 }
@@ -136,15 +270,18 @@ static inline void geo_internal_decode(uint64_t z, double *out_lat, double *out_
 // Min/Max/Clamp Utilities (Inline)
 // =========================================================
 
-static inline double geo_internal_min(double a, double b) {
+static inline double geo_internal_min(double a, double b)
+{
     return (a < b) ? a : b;
 }
 
-static inline double geo_internal_max(double a, double b) {
+static inline double geo_internal_max(double a, double b)
+{
     return (a > b) ? a : b;
 }
 
-static inline double geo_internal_clamp(double v, double lo, double hi) {
+static inline double geo_internal_clamp(double v, double lo, double hi)
+{
     return geo_internal_min(geo_internal_max(v, lo), hi);
 }
 
