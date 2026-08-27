@@ -28,7 +28,9 @@ struct GeoDensityWriter {
     size_t level_node_counts[GEO_PERSISTED_DENSITY_MAX_LEVELS];
     size_t touched_counts[GEO_PERSISTED_DENSITY_MAX_LEVELS];
     uint64_t expected_records;
+    uint64_t first_position;
     uint64_t next_position;
+    uint64_t final_position;
     uint64_t baseline;
     uint64_t current_root;
     uint64_t current_root_count;
@@ -38,9 +40,11 @@ struct GeoDensityWriter {
     size_t total_nodes;
     uint8_t prefix_bits;
     uint8_t level_count;
+    const size_t *root_offsets;
     bool root_active;
     bool root_hot;
     bool defer_cold_roots;
+    bool partition_fragment;
     bool failed;
 };
 
@@ -226,7 +230,7 @@ static bool density_writer_flush_root(GeoDensityWriter *writer)
         return true;
     }
 
-    bool root_hot = writer->defer_cold_roots
+    bool root_hot = writer->partition_fragment || writer->defer_cold_roots
                         ? writer->root_hot
                         : density_writer_is_hot(writer->current_root_count, writer->baseline);
 
@@ -238,9 +242,9 @@ static bool density_writer_flush_root(GeoDensityWriter *writer)
             size_t local_index = writer->touched_nodes[offset + touched];
             size_t node_index = offset + local_index;
             uint64_t node_count = writer->node_counts[node_index];
-            bool parent_hot = level_index == 0;
+            bool parent_hot = level_index == 0 || writer->partition_fragment;
 
-            if (level_index) {
+            if (level_index && !writer->partition_fragment) {
                 size_t parent_index = writer->level_offsets[level_index - 1U] + (local_index >> 2U);
 
                 parent_hot = density_writer_is_hot(writer->node_counts[parent_index], writer->baseline);
@@ -298,6 +302,7 @@ GeoDensityWriter *geo_density_writer_create(uint64_t record_count, uint8_t prefi
     }
 
     writer->expected_records = record_count;
+    writer->final_position = record_count;
     writer->prefix_bits = prefix_bits;
 
     if (prefix_bits) {
@@ -357,6 +362,35 @@ GeoDensityWriter *geo_density_writer_create(uint64_t record_count, uint8_t prefi
     return writer;
 }
 
+GeoDensityWriter *geo_density_writer_create_partition(uint64_t record_count,
+                                                       uint8_t prefix_bits,
+                                                       uint64_t first_position,
+                                                       uint64_t partition_records,
+                                                       const size_t *root_offsets)
+{
+    if ((prefix_bits && !root_offsets) || first_position > record_count || partition_records > record_count - first_position) {
+        return NULL;
+    }
+
+    GeoDensityWriter *writer = geo_density_writer_create(record_count, prefix_bits);
+
+    if (!writer) {
+        return NULL;
+    }
+
+    free(writer->deferred_morton);
+    writer->deferred_morton = NULL;
+    writer->deferred_capacity = 0;
+    writer->defer_cold_roots = false;
+    writer->next_position = first_position;
+    writer->first_position = first_position;
+    writer->final_position = first_position + partition_records;
+    writer->root_offsets = root_offsets;
+    writer->partition_fragment = true;
+
+    return writer;
+}
+
 void geo_density_writer_destroy(GeoDensityWriter *writer)
 {
     if (!writer) {
@@ -380,7 +414,7 @@ bool geo_density_writer_add(GeoDensityWriter *writer,
                             uint64_t first_position)
 {
     if (!writer || (!records && count) || writer->failed || first_position != writer->next_position ||
-        count > writer->expected_records - writer->next_position) {
+        writer->next_position > writer->final_position || count > writer->final_position - writer->next_position) {
         return false;
     }
 
@@ -398,9 +432,25 @@ bool geo_density_writer_add(GeoDensityWriter *writer,
             writer->root_active = true;
             writer->current_root = root;
             writer->current_root_begin = absolute_position;
+
+            if (writer->partition_fragment) {
+                uint64_t root_records = writer->prefix_bits
+                                            ? writer->root_offsets[root + 1U] - writer->root_offsets[root]
+                                            : writer->expected_records;
+
+                writer->root_hot = density_writer_is_hot(root_records, writer->baseline);
+            }
         }
 
         writer->current_root_count++;
+
+        if (writer->partition_fragment) {
+            if (writer->root_hot) {
+                density_writer_add_hot_record(writer, records[position].z, absolute_position);
+            }
+
+            continue;
+        }
 
         if (writer->defer_cold_roots && !writer->root_hot) {
             writer->deferred_morton[writer->deferred_count++] = records[position].z;
@@ -428,13 +478,124 @@ bool geo_density_writer_add(GeoDensityWriter *writer,
     return true;
 }
 
+static bool density_writer_append_partition_cells(GeoDensityWriter *writer,
+                                                  const GeoDensityWriter *partition,
+                                                  size_t level_index)
+{
+    GeoDensityWriterLevel *output = writer->levels + level_index;
+    const GeoDensityWriterLevel *input = partition->levels + level_index;
+
+    for (size_t cell_index = 0; cell_index < input->count; ++cell_index) {
+        const GeoPersistedDensityCell *cell = input->cells + cell_index;
+
+        if (output->count && output->cells[output->count - 1U].range_min == cell->range_min) {
+            GeoPersistedDensityCell *previous = output->cells + output->count - 1U;
+
+            if (previous->end != cell->begin) {
+                return false;
+            }
+
+            previous->end = cell->end;
+            continue;
+        }
+
+        if (!density_writer_level_reserve(output, output->count + 1U)) {
+            return false;
+        }
+
+        output->cells[output->count++] = *cell;
+    }
+
+    return true;
+}
+
+static void density_writer_prune_level(GeoDensityWriter *writer, size_t level_index)
+{
+    if (!level_index) {
+        return;
+    }
+
+    GeoDensityWriterLevel *level = writer->levels + level_index;
+    const GeoDensityWriterLevel *parents = writer->levels + level_index - 1U;
+    unsigned parent_bits = (unsigned) writer->prefix_bits + (unsigned) level_index * 2U;
+    unsigned parent_shift = 64U - parent_bits;
+    size_t parent_index = 0;
+    size_t output_count = 0;
+
+    for (size_t cell_index = 0; cell_index < level->count; ++cell_index) {
+        GeoPersistedDensityCell cell = level->cells[cell_index];
+        uint64_t parent_range = parent_shift ? (cell.range_min >> parent_shift) << parent_shift : cell.range_min;
+
+        while (parent_index < parents->count && parents->cells[parent_index].range_min < parent_range) {
+            parent_index++;
+        }
+
+        if (parent_index == parents->count || parents->cells[parent_index].range_min != parent_range) {
+            continue;
+        }
+
+        uint64_t parent_records = parents->cells[parent_index].end - parents->cells[parent_index].begin;
+
+        if (density_writer_is_hot(parent_records, writer->baseline)) {
+            level->cells[output_count++] = cell;
+        }
+    }
+
+    level->count = output_count;
+}
+
+bool geo_density_writer_merge_partitions(GeoDensityWriter *writer,
+                                         GeoDensityWriter *const *partitions,
+                                         size_t partition_count)
+{
+    if (!writer || (!partitions && partition_count) || writer->partition_fragment || writer->next_position || writer->root_active) {
+        return false;
+    }
+
+    uint64_t next_position = 0;
+
+    for (size_t partition_index = 0; partition_index < partition_count; ++partition_index) {
+        GeoDensityWriter *partition = partitions[partition_index];
+
+        if (!partition || !partition->partition_fragment || partition->expected_records != writer->expected_records ||
+            partition->prefix_bits != writer->prefix_bits || partition->next_position != partition->final_position ||
+            partition->first_position != next_position || partition->final_position < partition->first_position) {
+            return false;
+        }
+
+        if (!density_writer_flush_root(partition)) {
+            return false;
+        }
+
+        for (size_t level = 0; level < writer->level_count; ++level) {
+            if (!density_writer_append_partition_cells(writer, partition, level)) {
+                return false;
+            }
+        }
+
+        next_position = partition->final_position;
+    }
+
+    if (next_position != writer->expected_records) {
+        return false;
+    }
+
+    for (size_t level = 1; level < writer->level_count; ++level) {
+        density_writer_prune_level(writer, level);
+    }
+
+    writer->next_position = writer->expected_records;
+
+    return true;
+}
+
 bool geo_density_writer_append_file(GeoDensityWriter *writer,
                                     FILE *file,
                                     uint64_t *serialized_bytes,
                                     uint64_t *checksum)
 {
     if (!writer || !file || !serialized_bytes || !checksum || writer->failed ||
-        writer->next_position != writer->expected_records || !density_writer_flush_root(writer)) {
+        writer->next_position != writer->final_position || !density_writer_flush_root(writer)) {
         return false;
     }
 
@@ -773,7 +934,7 @@ bool geo_density_index_attach(GeoIndex *index, const void *data, size_t availabl
     }
 
     const GeoPersistedDensityHeader *header = data;
-    size_t serialized_size;
+    size_t serialized_size = 0;
 
     if (!density_header_validate(index, header, available, &serialized_size)) {
         return false;

@@ -1,7 +1,7 @@
 #ifndef GEO_INDEX_PRIVATE_H
 #define GEO_INDEX_PRIVATE_H
 
-#include "geo_index.h"
+#include "geobolt/geo_index.h"
 #include "geo_index_persistence.h"
 
 #include <stdio.h>
@@ -128,6 +128,11 @@ bool geo_density_index_attach(GeoIndex *index, const void *data, size_t availabl
 size_t geo_density_index_serialized_size(const GeoIndex *index);
 bool geo_density_index_serialize(const GeoIndex *index, void *destination, size_t size);
 GeoDensityWriter *geo_density_writer_create(uint64_t record_count, uint8_t prefix_bits);
+GeoDensityWriter *geo_density_writer_create_partition(uint64_t record_count,
+                                                       uint8_t prefix_bits,
+                                                       uint64_t first_position,
+                                                       uint64_t partition_records,
+                                                       const size_t *root_offsets);
 void geo_density_writer_destroy(GeoDensityWriter *writer);
 bool geo_density_writer_add(GeoDensityWriter *writer,
                             const GeoRecord *records,
@@ -137,6 +142,9 @@ bool geo_density_writer_append_file(GeoDensityWriter *writer,
                                     FILE *file,
                                     uint64_t *serialized_bytes,
                                     uint64_t *checksum);
+bool geo_density_writer_merge_partitions(GeoDensityWriter *writer,
+                                         GeoDensityWriter *const *partitions,
+                                         size_t partition_count);
 unsigned geo_density_index_query(const GeoIndex *index, uint64_t morton, size_t *local_records);
 
 bool geo_index_search_radius_plan_append(const GeoIndex *index,

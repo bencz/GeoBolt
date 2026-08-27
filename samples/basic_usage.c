@@ -1,103 +1,143 @@
-#include "geo_index.h"
-#include <stdio.h>
+#include "geobolt/geo_index.h"
+
 #include <inttypes.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-int main(void) {
-    printf("=== GeoIndex Demo ===\n\n");
-
-    // =========================================================
-    // Test 1: Encode / Decode
-    // =========================================================
-    printf("--- Test 1: Encode / Decode ---\n");
-
-    double lat = -23.5614123;
-    double lng = -46.6558819;
-
-    uint64_t z = geo_encode(lat, lng);
-    GeoPoint p = geo_decode(z);
-
-    printf("Encoded : %" PRIu64 "\n", z);
-    printf("Original: %.7f %.7f\n", lat, lng);
-    printf("Decoded : %.7f %.7f\n", p.lat, p.lng);
-    printf("Delta   : %.9f %.9f\n", fabs(lat - p.lat), fabs(lng - p.lng));
-    printf("Error   : %.4f meters\n\n", geo_haversine_m(lat, lng, p.lat, p.lng));
-
-    // =========================================================
-    // Test 2: Spatial Search
-    // =========================================================
-    printf("--- Test 2: Spatial Search ---\n");
-
-    GeoIndex *index = geo_index_create(100);
-    
-    geo_index_add(index, 10, -23.5505200, -46.6333090);  // Sao Paulo center
-    geo_index_add(index, 11, -23.5590000, -46.6400000);  // Nearby
-    geo_index_add(index, 12, -23.5874162, -46.6576336);  // ~5km away
-    geo_index_add(index, 13, -23.4542000, -46.5333000);  // ~15km away
-    geo_index_add(index, 14, -22.9068000, -43.1729000);  // Rio de Janeiro
-
-    if (!geo_index_build(index)) {
-        fprintf(stderr, "Failed to build the index\n");
-        geo_index_destroy(index);
-
-        return 1;
-    }
-
-    double search_lat = -23.5505200;
-    double search_lng = -46.6333090;
-    double radius_km = 5.0;
-
-    printf("Searching within %.1f km of (%.7f, %.7f):\n", 
-           radius_km, search_lat, search_lng);
-
+static bool print_radius_results(const GeoIndex *index,
+                                 double search_latitude,
+                                 double search_longitude,
+                                 double radius_km)
+{
     GeoSearchStats stats;
-    GeoSearchResult *result = geo_search_radius(index, search_lat, search_lng, radius_km, &stats);
+    GeoSearchResult *result = geo_search_radius(index, search_latitude, search_longitude, radius_km, &stats);
 
-    for (size_t i = 0; i < result->count; i++) {
-        GeoPoint pt = geo_decode(result->results[i].z);
-        double dist = geo_haversine_km(search_lat, search_lng, pt.lat, pt.lng);
+    if (!result) {
+        return false;
+    }
+
+    printf("Searching within %.1f km of (%.7f, %.7f):\n", radius_km, search_latitude, search_longitude);
+
+    for (size_t index_position = 0; index_position < result->count; ++index_position) {
+        GeoPoint point = geo_decode(result->results[index_position].z);
+        double distance_km = geo_haversine_km(search_latitude, search_longitude, point.lat, point.lng);
+
         printf("  FOUND id=%" PRIu64 " lat=%.7f lng=%.7f dist=%.3f km\n",
-               result->results[i].id, pt.lat, pt.lng, dist);
+               result->results[index_position].id,
+               point.lat,
+               point.lng,
+               distance_km);
     }
 
-    printf("\nStats: scanned=%" PRIu64 " matched=%" PRIu64 " time=%.3f ms\n",
-           stats.records_scanned, stats.records_matched, stats.search_time_ms);
+    printf("Stats: scanned=%" PRIu64 " matched=%" PRIu64 " time=%.3f ms\n",
+           stats.records_scanned,
+           stats.records_matched,
+           stats.search_time_ms);
 
     geo_result_destroy(result);
 
-    // =========================================================
-    // Test 3: K-Nearest Neighbors
-    // =========================================================
-    printf("\n--- Test 3: K-Nearest Neighbors ---\n");
+    return true;
+}
 
-    result = geo_search_knn(index, search_lat, search_lng, 3, 1000.0, &stats);
+static bool print_nearest_results(const GeoIndex *index, double search_latitude, double search_longitude)
+{
+    GeoSearchResult *result = geo_search_knn(index, search_latitude, search_longitude, 3U, 1000.0, NULL);
 
-    printf("3 nearest neighbors:\n");
-    for (size_t i = 0; i < result->count; i++) {
-        GeoPoint pt = geo_decode(result->results[i].z);
-        double dist = geo_haversine_km(search_lat, search_lng, pt.lat, pt.lng);
-        printf("  %zu. id=%" PRIu64 " dist=%.3f km\n", i + 1, result->results[i].id, dist);
+    if (!result) {
+        return false;
+    }
+
+    puts("3 nearest neighbors:");
+
+    for (size_t index_position = 0; index_position < result->count; ++index_position) {
+        GeoPoint point = geo_decode(result->results[index_position].z);
+        double distance_km = geo_haversine_km(search_latitude, search_longitude, point.lat, point.lng);
+
+        printf("  %zu. id=%" PRIu64 " dist=%.3f km\n",
+               index_position + 1U,
+               result->results[index_position].id,
+               distance_km);
     }
 
     geo_result_destroy(result);
 
-    // =========================================================
-    // Test 4: Bounding Box Search
-    // =========================================================
-    printf("\n--- Test 4: Bounding Box Search ---\n");
+    return true;
+}
 
-    result = geo_search_bbox(index, -24.0, -23.0, -47.0, -46.0, &stats);
+static bool print_bounding_box_results(const GeoIndex *index)
+{
+    GeoSearchResult *result = geo_search_bbox(index, -24.0, -23.0, -47.0, -46.0, NULL);
 
-    printf("Points in bounding box [-24,-23] x [-47,-46]:\n");
-    for (size_t i = 0; i < result->count; i++) {
-        GeoPoint pt = geo_decode(result->results[i].z);
+    if (!result) {
+        return false;
+    }
+
+    puts("Points in bounding box [-24,-23] x [-47,-46]:");
+
+    for (size_t index_position = 0; index_position < result->count; ++index_position) {
+        GeoPoint point = geo_decode(result->results[index_position].z);
+
         printf("  id=%" PRIu64 " lat=%.7f lng=%.7f\n",
-               result->results[i].id, pt.lat, pt.lng);
+               result->results[index_position].id,
+               point.lat,
+               point.lng);
     }
 
     geo_result_destroy(result);
+
+    return true;
+}
+
+int main(void)
+{
+    const double latitude = -23.5614123;
+    const double longitude = -46.6558819;
+    uint64_t morton_code = geo_encode(latitude, longitude);
+    GeoPoint decoded = geo_decode(morton_code);
+
+    puts("=== GeoIndex Demo ===");
+    puts("\n--- Encode / Decode ---");
+    printf("Encoded : %" PRIu64 "\n", morton_code);
+    printf("Original: %.7f %.7f\n", latitude, longitude);
+    printf("Decoded : %.7f %.7f\n", decoded.lat, decoded.lng);
+    printf("Delta   : %.9f %.9f\n", fabs(latitude - decoded.lat), fabs(longitude - decoded.lng));
+    printf("Error   : %.4f meters\n", geo_haversine_m(latitude, longitude, decoded.lat, decoded.lng));
+
+    GeoIndex *index = geo_index_create(100U);
+
+    if (!index) {
+        fputs("Failed to create the index\n", stderr);
+        return EXIT_FAILURE;
+    }
+
+    bool populated = geo_index_add(index, 10U, -23.5505200, -46.6333090) &&
+                     geo_index_add(index, 11U, -23.5590000, -46.6400000) &&
+                     geo_index_add(index, 12U, -23.5874162, -46.6576336) &&
+                     geo_index_add(index, 13U, -23.4542000, -46.5333000) &&
+                     geo_index_add(index, 14U, -22.9068000, -43.1729000) &&
+                     geo_index_build(index);
+
+    if (!populated) {
+        fputs("Failed to populate and build the index\n", stderr);
+        geo_index_destroy(index);
+        return EXIT_FAILURE;
+    }
+
+    const double search_latitude = -23.5505200;
+    const double search_longitude = -46.6333090;
+    bool succeeded = print_radius_results(index, search_latitude, search_longitude, 5.0) &&
+                     print_nearest_results(index, search_latitude, search_longitude) &&
+                     print_bounding_box_results(index);
+
     geo_index_destroy(index);
 
-    printf("\n=== Demo Complete ===\n");
-    return 0;
+    if (!succeeded) {
+        fputs("A sample query failed\n", stderr);
+        return EXIT_FAILURE;
+    }
+
+    puts("\n=== Demo Complete ===");
+
+    return EXIT_SUCCESS;
 }

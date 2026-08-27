@@ -1,8 +1,12 @@
 # GeoBolt
 
-GeoBolt is a compact C11 geospatial index optimized for build-once, query-many workloads. Each coordinate pair is normalized to two
-32-bit integers and interleaved into one 64-bit Morton code. Together with the 64-bit application ID, every indexed record occupies
-exactly 16 bytes.
+GeoBolt is a C11 single-server geospatial database engine and low-level spatial-index library. Each coordinate pair is normalized to two
+32-bit integers and interleaved into one 64-bit Morton code. Together with the generic 64-bit object ID, every hot indexed record
+occupies exactly 16 bytes. The database layer adds ordered WAL recovery, autonomous checkpointing, immutable publication, and
+background compaction without changing that query layout.
+
+Design, wire-format, operational, and storage-roadmap documents are indexed in [`docs/`](docs/README.md). Public examples live in
+[`samples/`](samples/README.md).
 
 ## Highlights
 
@@ -22,6 +26,12 @@ exactly 16 bytes.
 - External-memory streaming builds with bounded chunks, sorted runs, k-way merge, and atomic publication.
 - Versioned immutable segment sets with checksummed manifests, aggregate queries, and direct Morton compaction.
 - Linearizable batch deletion and ID reinsertion through a durable mutation WAL, with tombstone reclamation during compaction.
+- Single-server database root with a segmented checksummed WAL, idempotent crash recovery, durable state watermarks, and autonomous WAL
+  checkpointing and segment compaction.
+- Production `geoboltd` boundary with a nonblocking `epoll` reactor, bounded persistent workers, connection/job/memory backpressure,
+  token authentication, persistent TCP clients, operational counters, and coordinated signal shutdown.
+- Thread-safe blocking C driver with bounded frames, connect/read/write deadlines, endian-independent serialization, and stream
+  poisoning after unrecoverable protocol or I/O errors.
 - Cache-line-sharded QSBR reader counters for segment publication and compaction; query readers do not acquire an rwlock.
 - Selective runtime AVX-512/AVX2+FMA dispatch on x86-64, NEON on ARM64, and a portable scalar backend.
 - SIMD batch validation and direct coordinate/ID encoding into the final 16-byte record layout.
@@ -40,6 +50,7 @@ make test-scalar
 make sample
 make demo
 make benchmark-tombstones
+make benchmark-server
 ```
 
 Compiler and linker settings remain overridable:
@@ -64,14 +75,68 @@ make USE_JEMALLOC=1 all    # Force -ljemalloc when detection metadata is unavail
 Changing `USE_JEMALLOC` forces optimized executables to relink, preventing a stale binary from silently retaining the previous
 allocator selection.
 
-Source organization is intentional: correctness and concurrency validation lives in `tests/`, capacity workloads live in
-`benchmarks/`, and complete public-API examples live in `samples/`. Production modules remain at the repository root until a separate
-source/include hierarchy provides a measurable build or maintenance benefit.
+Source organization is intentional: public headers live under `include/geobolt/`; production code is separated into `src/core`,
+`src/engine`, `src/query`, `src/storage`, `src/runtime`, and `src/simd`. The wire server, protocol codec, and C driver have independent
+`src/server`, `src/protocol`, and `src/client` boundaries so protocol concerns cannot leak into the storage engine. Correctness validation
+lives in `tests/`; capacity workloads live in `benchmarks/`; complete public-API examples live in `samples/`. The root Makefile includes
+non-recursive fragments from `mk/`, retaining one dependency graph for parallel builds and LTO. The static product library is
+`build/libgeobolt.a`.
+
+## Single-server daemon
+
+`geoboltd` runs in the foreground and owns one database root. Token files must be regular files with permissions `0600` or stricter;
+the trailing CR/LF is removed. The default bind address is loopback because the current protocol authenticates but does not encrypt.
+
+```bash
+printf 'replace-with-a-long-random-token\n' > geobolt.token
+chmod 600 geobolt.token
+bin/geoboltd --data /var/lib/geobolt/primary --token-file geobolt.token --workers 16
+```
+
+Use `bin/geoboltd --help` for connection, queue, frame, and global in-flight memory limits. `SIGINT` and `SIGTERM` initiate a clean
+shutdown. Applications use `<geobolt/client.h>`; connections are persistent and a single handle serializes concurrent callers safely.
+Batch writes remain the intended high-throughput ingestion path. HA and replication are intentionally deferred.
+
+## Database API
+
+The database API owns every file below its root. IDs identify arbitrary user objects; they do not imply vehicles or another domain.
+Writes accept pre-encoded Morton coordinates so ingestion pipelines can vectorize encoding before committing a large batch.
+
+```c
+#include <geobolt/geobolt.h>
+
+GeoDatabaseStatus status;
+GeoDatabaseConfig config = geo_database_default_config();
+GeoDatabase *database = geo_database_open("/var/lib/geobolt/primary", &config, &status);
+
+GeoDatabaseMutation mutations[] = {
+    { .object_id = 1001, .morton_code = geo_encode(latitude, longitude), .operation = GEO_DATABASE_UPSERT },
+    { .object_id = 1002, .operation = GEO_DATABASE_DELETE },
+};
+
+if (database && geo_database_write(database, mutations, 2) == GEO_DATABASE_OK) {
+    size_t count;
+    geo_database_search_radius_count(database, latitude, longitude, radius_km, &count, NULL);
+}
+
+geo_database_close(database);
+```
+
+A batch is checksummed and synced in the segmented WAL before publication. Its derived immutable segment has a deterministic sequence
+name. The segment manifest and mutation state become durable before the database state watermark advances. Recovery can therefore
+reapply a transaction that reached publication but not the watermark without duplicating visible objects. After a configured number
+of operations, GeoBolt checkpoints the compact mutation state, creates a new durable WAL segment, and reclaims older WAL segments.
+Failures after a WAL commit poison further writes in that process so ambiguous durability is resolved only by normal recovery.
+
+The current engine deliberately optimizes batch ingestion. The next storage step is a WAL-backed mutable/frozen memtable and group
+commit, which will amortize segment construction and state synchronization across independent socket clients while preserving the same
+sequence and recovery invariants. Single-operation convenience calls are correct and durable, but are not the intended maximum-
+throughput ingestion path yet.
 
 ## Core API
 
 ```c
-#include "geo_index.h"
+#include <geobolt/geo_index.h>
 
 GeoIndex *index = geo_index_create(1000000);
 
@@ -302,10 +367,11 @@ Radius, bounding-box, count-only, and exact kNN queries operate across every act
 into the caller buffer and do not allocate when its capacity is sufficient. Large compactions sample the already sorted inputs to form
 balanced contiguous Morton ranges, then one visibility pass computes exact per-range output offsets and the persisted high-16 prefix
 histogram. Independent workers merge those ranges into disjoint `pwrite` offsets. Each partition computes a zero-seed polynomial
-checksum that is combined in output order, so checksum generation requires no serial reread. Density metadata is constructed from one
-sequential page-cache pass after the parallel write. Small merges retain the lower-overhead single-pass path. Neither path decodes,
-re-encodes, nor radix-sorts mmap records. After the compacted file is durable, one manifest rename makes it active. Superseded segment
-files remain available for an explicit retention policy.
+checksum and one density fragment while records are already hot. Checksums are combined in output order, and adjacent density fragments
+coalesce equal boundary cells before global hot-parent pruning. The former serial reread of the complete compacted record section is
+therefore gone. Small merges retain the lower-overhead single-pass path. Neither path decodes, re-encodes, nor radix-sorts mmap records.
+After the compacted file is durable, one manifest rename makes it active. Superseded segment files remain available for an explicit
+retention policy.
 
 Compaction specializes visibility work by mutation cardinality. With no mutations, the physical record count is already exact and the
 precount pass is skipped. Up to eight active exceptions use the cache-resident small-entry path directly. Larger exception sets build a
@@ -448,11 +514,11 @@ from approximately 395–433 microseconds across all 16 segments to approximatel
 reduction. This is why production deployments should bound the number of active level-0 segments.
 
 The partitioned compaction benchmark alternated serial and eight-worker runs over the same eight one-million-record mmap segments,
-using Clang 22.1.8, jemalloc, 32 Morton partitions, validated record cardinality, and a checksummed reopen after every output. Across five
-idle-host uniform pairs, serial compaction averaged 174.574 ms and parallel compaction 97.748 ms, a 1.786x speedup. With 80% of records
-inside one São Paulo hotspot, adaptive sampled boundaries retained a 1.572x speedup: 199.950 ms versus 127.202 ms. These measurements
-include visibility counting, prefix and density metadata construction, durable output publication, and manifest replacement; CPU
-frequency and affinity were not pinned.
+using Clang 22.1.8, jemalloc, 32 Morton partitions, validated record cardinality, and a checksummed reopen after every output. Across
+three reported-idle uniform pairs, serial compaction averaged 176.566 ms and parallel compaction 73.699 ms, a 2.396x speedup. With 80%
+of records inside one São Paulo hotspot, adaptive sampled boundaries retained a 2.589x speedup: 204.878 ms versus 79.124 ms. These
+measurements include visibility counting, in-flight prefix/density construction, durable output publication, and manifest replacement;
+CPU frequency and affinity were not pinned.
 
 For one million records with 100,000 active tombstones, ten warmed global count queries perform ten million visibility checks and
 completed in 52.67–58.45 ms across three consecutive runs on the reported-idle x86-64 host with Clang 22.1.8, jemalloc, one query
@@ -511,10 +577,14 @@ The checked-in `.clang-format` documents the intended layout.
 
 ## Remaining directions
 
+- WAL-backed mutable/frozen memtables, group commit, reusable flush scratch, and backpressure based on dirty bytes rather than request
+  count.
+- Generic metadata schemas and columnar property storage joined to the hot `object_id`/Morton index without widening `GeoRecord`.
 - Portable, checksummed, cross-endian persistence format.
 - Multi-level compaction with record-count/byte-size policies and retention-aware garbage collection.
 - Optional Hilbert ordering for workloads where its improved locality offsets the higher encoding cost.
 - ARM SVE2 and additional fused kernels where architecture-specific benchmarks justify them.
 - Automatic Linux NUMA topology discovery and memory-policy binding on top of the explicit CPU/replica mapping API.
 - Per-worker prepared-plan caches for repeated query centers and radius classes.
-- Language bindings and a stable opaque-ABI layer.
+- Language bindings and a stable opaque-ABI layer. HA, replication, and geo-replication are intentionally outside the current
+  single-server milestone.

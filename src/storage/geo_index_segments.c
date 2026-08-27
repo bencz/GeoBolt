@@ -2,11 +2,12 @@
 #define _XOPEN_SOURCE 700
 #endif
 
-#include "geo_index.h"
+#include "geobolt/geo_index.h"
 #include "geo_index_internal.h"
 #include "geo_index_io.h"
 #include "geo_index_persistence.h"
 #include "geo_index_private.h"
+#include "geo_thread_pool.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -124,12 +125,6 @@ typedef enum {
 } GeoBackgroundCompactionMode;
 
 typedef struct {
-    GeoSegmentSet *set;
-    char *output_path;
-    GeoBackgroundCompactionMode mode;
-} GeoBackgroundCompactionTask;
-
-typedef struct {
     size_t index;
     size_t record_count;
 } GeoSegmentCandidate;
@@ -165,6 +160,7 @@ struct GeoSegmentSet {
     pthread_mutex_t background_lock;
     pthread_cond_t background_condition;
     pthread_t background_thread;
+    GeoThreadPool *compaction_pool;
     atomic_bool writer_pending;
     GeoReaderShard *reader_shards;
     GeoSegmentCompactionPolicy background_policy;
@@ -174,7 +170,9 @@ struct GeoSegmentSet {
     uint64_t background_failed_runs;
     bool background_enabled;
     bool background_running;
-    bool background_joinable;
+    bool background_requested;
+    bool background_thread_started;
+    bool background_stop;
     bool background_last_succeeded;
     bool compaction_running;
     bool locks_initialized;
@@ -1200,9 +1198,16 @@ void geo_segment_set_destroy(GeoSegmentSet *set)
     if (set->locks_initialized) {
         pthread_mutex_lock(&set->background_lock);
         set->background_enabled = false;
+        set->background_requested = false;
+        set->background_stop = true;
+        pthread_cond_broadcast(&set->background_condition);
         pthread_mutex_unlock(&set->background_lock);
 
-        (void) geo_segment_set_wait_for_background_compaction(set, NULL);
+        if (set->background_thread_started) {
+            (void) pthread_join(set->background_thread, NULL);
+        }
+
+        geo_thread_pool_destroy(set->compaction_pool);
     }
 #endif
 
@@ -2015,106 +2020,135 @@ static GeoBackgroundCompactionMode segment_background_compaction_mode(const GeoS
 
 static void *segment_background_compaction_worker(void *argument)
 {
-    GeoBackgroundCompactionTask *task = argument;
-    GeoSegmentCompactionStats total_stats = { 0 };
-    char *output_path = task->output_path;
-    GeoBackgroundCompactionMode mode = task->mode;
-    size_t mutation_rewrite_passes = 0;
-    bool succeeded = true;
+    GeoSegmentSet *set = argument;
 
-    while (output_path) {
-        GeoSegmentCompactionStats partial_stats;
+    pthread_mutex_lock(&set->background_lock);
 
-        if (mode == GEO_BACKGROUND_COMPACTION_MUTATION_REWRITE) {
-            succeeded = geo_segment_set_compact(task->set, output_path, &partial_stats);
-            mutation_rewrite_passes++;
-        } else {
-            succeeded = segment_set_compact_size_tier(task->set, output_path, &partial_stats);
+    while (!set->background_stop) {
+        while (!set->background_requested && !set->background_stop) {
+            pthread_cond_wait(&set->background_condition, &set->background_lock);
         }
 
-        free(output_path);
-        output_path = NULL;
-
-        if (!succeeded ||
-            partial_stats.records_written > UINT64_MAX - total_stats.records_written ||
-            partial_stats.input_segments > SIZE_MAX - total_stats.input_segments ||
-            partial_stats.partition_count > SIZE_MAX - total_stats.partition_count) {
-            succeeded = false;
+        if (set->background_stop) {
             break;
         }
 
-        total_stats.records_written += partial_stats.records_written;
-        total_stats.input_segments += partial_stats.input_segments;
-        total_stats.partition_count += partial_stats.partition_count;
-        total_stats.merge_time_ms += partial_stats.merge_time_ms;
+        set->background_requested = false;
+        set->background_running = true;
+        memset(&set->background_last_stats, 0, sizeof(set->background_last_stats));
+        set->background_last_succeeded = false;
 
-        if (partial_stats.worker_count > total_stats.worker_count) {
-            total_stats.worker_count = partial_stats.worker_count;
+        GeoSegmentCompactionStats total_stats = { 0 };
+        size_t mutation_rewrite_passes = 0;
+        bool succeeded = true;
+        GeoBackgroundCompactionMode mode = set->background_enabled
+                                               ? segment_background_compaction_mode(set, &set->background_policy)
+                                               : GEO_BACKGROUND_COMPACTION_NONE;
+        char *output_path = mode != GEO_BACKGROUND_COMPACTION_NONE
+                                ? segment_create_background_output_path(set, set->background_directory)
+                                : NULL;
+
+        if (mode != GEO_BACKGROUND_COMPACTION_NONE && !output_path) {
+            succeeded = false;
         }
 
-        pthread_mutex_lock(&task->set->background_lock);
+        pthread_mutex_unlock(&set->background_lock);
 
-        mode = task->set->background_enabled
-                   ? segment_background_compaction_mode(task->set, &task->set->background_policy)
-                   : GEO_BACKGROUND_COMPACTION_NONE;
+        while (output_path) {
+            GeoSegmentCompactionStats partial_stats;
 
-        if (mode == GEO_BACKGROUND_COMPACTION_MUTATION_REWRITE &&
-            mutation_rewrite_passes >= task->set->background_policy.maximum_mutation_rewrite_passes) {
-            mode = GEO_BACKGROUND_COMPACTION_NONE;
-        }
-
-        if (mode != GEO_BACKGROUND_COMPACTION_NONE) {
-            output_path = segment_create_background_output_path(task->set, task->set->background_directory);
-
-            if (!output_path) {
-                succeeded = false;
+            if (mode == GEO_BACKGROUND_COMPACTION_MUTATION_REWRITE) {
+                succeeded = geo_segment_set_compact(set, output_path, &partial_stats);
+                mutation_rewrite_passes++;
+            } else {
+                succeeded = segment_set_compact_size_tier(set, output_path, &partial_stats);
             }
+
+            free(output_path);
+            output_path = NULL;
+
+            if (!succeeded ||
+                partial_stats.records_written > UINT64_MAX - total_stats.records_written ||
+                partial_stats.input_segments > SIZE_MAX - total_stats.input_segments ||
+                partial_stats.partition_count > SIZE_MAX - total_stats.partition_count) {
+                succeeded = false;
+                break;
+            }
+
+            total_stats.records_written += partial_stats.records_written;
+            total_stats.input_segments += partial_stats.input_segments;
+            total_stats.partition_count += partial_stats.partition_count;
+            total_stats.merge_time_ms += partial_stats.merge_time_ms;
+
+            if (partial_stats.worker_count > total_stats.worker_count) {
+                total_stats.worker_count = partial_stats.worker_count;
+            }
+
+            pthread_mutex_lock(&set->background_lock);
+
+            mode = set->background_enabled
+                       ? segment_background_compaction_mode(set, &set->background_policy)
+                       : GEO_BACKGROUND_COMPACTION_NONE;
+
+            if (mode == GEO_BACKGROUND_COMPACTION_MUTATION_REWRITE &&
+                mutation_rewrite_passes >= set->background_policy.maximum_mutation_rewrite_passes) {
+                mode = GEO_BACKGROUND_COMPACTION_NONE;
+            }
+
+            if (mode != GEO_BACKGROUND_COMPACTION_NONE) {
+                output_path = segment_create_background_output_path(set, set->background_directory);
+
+                if (!output_path) {
+                    succeeded = false;
+                }
+            }
+
+            pthread_mutex_unlock(&set->background_lock);
         }
 
-        pthread_mutex_unlock(&task->set->background_lock);
+        pthread_mutex_lock(&set->background_lock);
+        set->background_last_stats = total_stats;
+        set->background_last_succeeded = succeeded;
+
+        if (total_stats.records_written > UINT64_MAX - set->background_total_stats.records_written) {
+            set->background_total_stats.records_written = UINT64_MAX;
+        } else {
+            set->background_total_stats.records_written += total_stats.records_written;
+        }
+
+        if (total_stats.input_segments > SIZE_MAX - set->background_total_stats.input_segments) {
+            set->background_total_stats.input_segments = SIZE_MAX;
+        } else {
+            set->background_total_stats.input_segments += total_stats.input_segments;
+        }
+
+        if (total_stats.partition_count > SIZE_MAX - set->background_total_stats.partition_count) {
+            set->background_total_stats.partition_count = SIZE_MAX;
+        } else {
+            set->background_total_stats.partition_count += total_stats.partition_count;
+        }
+
+        if (total_stats.worker_count > set->background_total_stats.worker_count) {
+            set->background_total_stats.worker_count = total_stats.worker_count;
+        }
+
+        set->background_total_stats.merge_time_ms += total_stats.merge_time_ms;
+
+        if (set->background_completed_runs < UINT64_MAX) {
+            set->background_completed_runs++;
+        }
+
+        if (!succeeded && set->background_failed_runs < UINT64_MAX) {
+            set->background_failed_runs++;
+        }
+
+        set->background_running = false;
+        pthread_cond_broadcast(&set->background_condition);
     }
 
-    pthread_mutex_lock(&task->set->background_lock);
-    task->set->background_last_stats = total_stats;
-    task->set->background_last_succeeded = succeeded;
-
-    if (total_stats.records_written > UINT64_MAX - task->set->background_total_stats.records_written) {
-        task->set->background_total_stats.records_written = UINT64_MAX;
-    } else {
-        task->set->background_total_stats.records_written += total_stats.records_written;
-    }
-
-    if (total_stats.input_segments > SIZE_MAX - task->set->background_total_stats.input_segments) {
-        task->set->background_total_stats.input_segments = SIZE_MAX;
-    } else {
-        task->set->background_total_stats.input_segments += total_stats.input_segments;
-    }
-
-    if (total_stats.partition_count > SIZE_MAX - task->set->background_total_stats.partition_count) {
-        task->set->background_total_stats.partition_count = SIZE_MAX;
-    } else {
-        task->set->background_total_stats.partition_count += total_stats.partition_count;
-    }
-
-    if (total_stats.worker_count > task->set->background_total_stats.worker_count) {
-        task->set->background_total_stats.worker_count = total_stats.worker_count;
-    }
-
-    task->set->background_total_stats.merge_time_ms += total_stats.merge_time_ms;
-
-    if (task->set->background_completed_runs < UINT64_MAX) {
-        task->set->background_completed_runs++;
-    }
-
-    if (!succeeded && task->set->background_failed_runs < UINT64_MAX) {
-        task->set->background_failed_runs++;
-    }
-
-    task->set->background_running = false;
-    pthread_cond_broadcast(&task->set->background_condition);
-    pthread_mutex_unlock(&task->set->background_lock);
-
-    free(task);
+    set->background_running = false;
+    pthread_cond_broadcast(&set->background_condition);
+    pthread_mutex_unlock(&set->background_lock);
 
     return NULL;
 }
@@ -2125,54 +2159,13 @@ static void segment_schedule_background_compaction(GeoSegmentSet *set)
         return;
     }
 
-    if (set->background_joinable && !set->background_running) {
-        pthread_t completed_thread = set->background_thread;
-
-        set->background_joinable = false;
-        pthread_mutex_unlock(&set->background_lock);
-        (void) pthread_join(completed_thread, NULL);
-
-        if (pthread_mutex_lock(&set->background_lock) != 0) {
-            return;
-        }
-    }
-
-    GeoBackgroundCompactionMode mode = set->background_enabled && !set->background_running
+    GeoBackgroundCompactionMode mode = set->background_enabled && !set->background_requested && !set->background_running
                                            ? segment_background_compaction_mode(set, &set->background_policy)
                                            : GEO_BACKGROUND_COMPACTION_NONE;
-    bool should_compact = mode != GEO_BACKGROUND_COMPACTION_NONE;
 
-    if (!should_compact) {
-        pthread_mutex_unlock(&set->background_lock);
-
-        return;
-    }
-
-    char *output_path = segment_create_background_output_path(set, set->background_directory);
-    GeoBackgroundCompactionTask *task = output_path ? malloc(sizeof(*task)) : NULL;
-
-    if (!task) {
-        free(output_path);
-        pthread_mutex_unlock(&set->background_lock);
-
-        return;
-    }
-
-    task->set = set;
-    task->output_path = output_path;
-    task->mode = mode;
-    memset(&set->background_last_stats, 0, sizeof(set->background_last_stats));
-    set->background_last_succeeded = false;
-    set->background_running = true;
-
-    int create_result = pthread_create(&set->background_thread, NULL, segment_background_compaction_worker, task);
-
-    if (create_result == 0) {
-        set->background_joinable = true;
-    } else {
-        set->background_running = false;
-        free(task->output_path);
-        free(task);
+    if (mode != GEO_BACKGROUND_COMPACTION_NONE) {
+        set->background_requested = true;
+        pthread_cond_signal(&set->background_condition);
     }
 
     pthread_mutex_unlock(&set->background_lock);
@@ -2214,31 +2207,30 @@ bool geo_segment_set_configure_background_compaction(GeoSegmentSet *set,
         return false;
     }
 
-    if (set->background_running) {
+    if (set->background_running || set->background_requested) {
         pthread_mutex_unlock(&set->background_lock);
         free(canonical_directory);
 
         return false;
     }
 
-    pthread_t completed_thread;
-    bool join_completed_thread = set->background_joinable;
-
-    if (join_completed_thread) {
-        completed_thread = set->background_thread;
-        set->background_joinable = false;
-    }
-
     free(set->background_directory);
     set->background_directory = canonical_directory;
     set->background_policy = *policy;
     set->background_enabled = true;
-    pthread_mutex_unlock(&set->background_lock);
 
-    if (join_completed_thread) {
-        (void) pthread_join(completed_thread, NULL);
+    if (!set->background_thread_started) {
+        if (pthread_create(&set->background_thread, NULL, segment_background_compaction_worker, set) != 0) {
+            set->background_enabled = false;
+            pthread_mutex_unlock(&set->background_lock);
+
+            return false;
+        }
+
+        set->background_thread_started = true;
     }
 
+    pthread_mutex_unlock(&set->background_lock);
     segment_schedule_background_compaction(set);
 
     return true;
@@ -2278,7 +2270,7 @@ bool geo_segment_set_wait_for_background_compaction(GeoSegmentSet *set,
         return false;
     }
 
-    while (set->background_running) {
+    while (set->background_running || set->background_requested) {
         if (pthread_cond_wait(&set->background_condition, &set->background_lock) != 0) {
             pthread_mutex_unlock(&set->background_lock);
 
@@ -2286,23 +2278,15 @@ bool geo_segment_set_wait_for_background_compaction(GeoSegmentSet *set,
         }
     }
 
-    if (!set->background_joinable) {
-        pthread_mutex_unlock(&set->background_lock);
-
-        return true;
-    }
-
-    pthread_t completed_thread = set->background_thread;
-    bool succeeded = set->background_last_succeeded;
+    bool succeeded = !set->background_completed_runs || set->background_last_succeeded;
 
     if (stats) {
         *stats = set->background_last_stats;
     }
 
-    set->background_joinable = false;
     pthread_mutex_unlock(&set->background_lock);
 
-    return pthread_join(completed_thread, NULL) == 0 && succeeded;
+    return succeeded;
 #else
     (void) set;
 
@@ -3092,6 +3076,7 @@ typedef struct {
     size_t output_begin;
     size_t record_count;
     uint64_t zero_seed_checksum;
+    GeoDensityWriter *density_writer;
     bool reaches_morton_end;
     bool succeeded;
 } GeoCompactionPartition;
@@ -3137,29 +3122,6 @@ static bool segment_pwrite_all(int descriptor, const void *data, size_t size, of
         bytes += (size_t) written;
         size -= (size_t) written;
         offset += written;
-    }
-
-    return true;
-}
-
-static bool segment_pread_all(int descriptor, void *data, size_t size, off_t offset)
-{
-    unsigned char *bytes = data;
-
-    while (size) {
-        ssize_t received = pread(descriptor, bytes, size, offset);
-
-        if (received < 0 && errno == EINTR) {
-            continue;
-        }
-
-        if (received <= 0) {
-            return false;
-        }
-
-        bytes += (size_t) received;
-        size -= (size_t) received;
-        offset += received;
     }
 
     return true;
@@ -3212,11 +3174,12 @@ static bool segment_compaction_flush_records(const GeoCompactionMerge *merge,
     size_t bytes = count * sizeof(*scratch->output_buffer);
     uint64_t byte_offset = sizeof(GeoFileHeader) + (uint64_t) first_output_record * sizeof(GeoRecord);
 
-    if (merge->single_pass_density &&
-        !geo_density_writer_add(merge->single_pass_density,
-                                scratch->output_buffer,
-                                count,
-                                first_output_record)) {
+    GeoDensityWriter *density_writer = merge->single_pass_density
+                                           ? merge->single_pass_density
+                                           : partition->density_writer;
+
+    if (density_writer &&
+        !geo_density_writer_add(density_writer, scratch->output_buffer, count, first_output_record)) {
         return false;
     }
 
@@ -3333,16 +3296,19 @@ static bool segment_merge_partition(GeoCompactionMerge *merge,
     return partition->succeeded;
 }
 
-static void *segment_compaction_merge_worker(void *argument)
+static bool segment_compaction_merge_worker(void *argument, size_t worker_index, size_t worker_count)
 {
     GeoCompactionMerge *merge = argument;
     GeoCompactionScratch scratch;
+
+    (void) worker_index;
+    (void) worker_count;
 
     if (!segment_compaction_scratch_initialize(merge, &scratch)) {
         segment_compaction_scratch_destroy(&scratch);
         atomic_store_explicit(&merge->failed, true, memory_order_release);
 
-        return NULL;
+        return false;
     }
 
     while (!atomic_load_explicit(&merge->failed, memory_order_acquire)) {
@@ -3360,7 +3326,7 @@ static void *segment_compaction_merge_worker(void *argument)
 
     segment_compaction_scratch_destroy(&scratch);
 
-    return NULL;
+    return !atomic_load_explicit(&merge->failed, memory_order_acquire);
 }
 
 static size_t segment_compaction_worker_count(uint64_t record_count, size_t requested_workers)
@@ -3536,62 +3502,39 @@ static size_t segment_compaction_build_partitions(const GeoCompactionMerge *merg
 }
 
 static bool segment_compaction_execute(GeoCompactionMerge *merge,
+                                       GeoThreadPool *pool,
                                        size_t worker_limit,
                                        size_t *workers_executed)
 {
-    pthread_t workers[GEO_COMPACTION_MAX_WORKERS - 1U];
-    size_t workers_started = 0;
-
     atomic_init(&merge->next_partition, 0);
     atomic_init(&merge->failed, false);
 
-    while (workers_started + 1U < worker_limit &&
-           pthread_create(workers + workers_started, NULL, segment_compaction_merge_worker, merge) == 0) {
-        workers_started++;
+    if (worker_limit == 1U) {
+        *workers_executed = 1U;
+
+        return segment_compaction_merge_worker(merge, 0U, 1U);
     }
 
-    *workers_executed = workers_started + 1U;
-
-    (void) segment_compaction_merge_worker(merge);
-
-    for (size_t worker = 0; worker < workers_started; ++worker) {
-        if (pthread_join(workers[worker], NULL) != 0) {
-            atomic_store_explicit(&merge->failed, true, memory_order_release);
-        }
-    }
-
-    return !atomic_load_explicit(&merge->failed, memory_order_acquire);
+    return pool &&
+           geo_thread_pool_run(pool,
+                               worker_limit,
+                               segment_compaction_merge_worker,
+                               merge,
+                               workers_executed) &&
+           !atomic_load_explicit(&merge->failed, memory_order_acquire);
 }
 
-static bool segment_compaction_build_density(int descriptor,
-                                             uint64_t record_count,
-                                             GeoDensityWriter *density_writer)
+static void segment_compaction_destroy_density_partitions(GeoDensityWriter **density_partitions, size_t partition_count)
 {
-    GeoRecord *buffer = malloc(GEO_SEGMENT_OUTPUT_BUFFER_RECORDS * sizeof(*buffer));
-
-    if (!buffer) {
-        return false;
+    if (!density_partitions) {
+        return;
     }
 
-    uint64_t position = 0;
-    bool succeeded = true;
-
-    while (succeeded && position < record_count) {
-        uint64_t remaining = record_count - position;
-        size_t count = remaining > GEO_SEGMENT_OUTPUT_BUFFER_RECORDS
-                           ? GEO_SEGMENT_OUTPUT_BUFFER_RECORDS
-                           : (size_t) remaining;
-        size_t bytes = count * sizeof(*buffer);
-        uint64_t byte_offset = sizeof(GeoFileHeader) + position * sizeof(GeoRecord);
-
-        succeeded = segment_pread_all(descriptor, buffer, bytes, (off_t) byte_offset) &&
-                    geo_density_writer_add(density_writer, buffer, count, position);
-        position += succeeded ? count : 0;
+    for (size_t partition = 0; partition < partition_count; ++partition) {
+        geo_density_writer_destroy(density_partitions[partition]);
     }
 
-    free(buffer);
-
-    return succeeded;
+    free(density_partitions);
 }
 
 static bool segment_write_compacted_file(GeoIndex *const *segments,
@@ -3601,6 +3544,7 @@ static bool segment_write_compacted_file(GeoIndex *const *segments,
                                          size_t segment_count,
                                          uint64_t record_count,
                                          const char *output_path,
+                                         GeoThreadPool *compaction_pool,
                                          size_t requested_workers,
                                          size_t *workers_used,
                                          size_t *partitions_used)
@@ -3625,6 +3569,7 @@ static bool segment_write_compacted_file(GeoIndex *const *segments,
     GeoCompactionPartition *partitions = calloc(maximum_partitions, sizeof(*partitions));
     size_t *fine_prefix_counts = NULL;
     size_t *fine_prefix_offsets = NULL;
+    GeoDensityWriter **density_partitions = NULL;
 
     if ((prefix_count && !prefix_offsets) || !density_writer || !partitions) {
         free(partitions);
@@ -3699,6 +3644,33 @@ static bool segment_write_compacted_file(GeoIndex *const *segments,
 
         segment_compaction_build_prefix_offsets(fine_prefix_offsets, prefix_bits, prefix_offsets);
 
+        density_partitions = calloc(merge.partition_count, sizeof(*density_partitions));
+
+        for (size_t partition = 0; density_partitions && partition < merge.partition_count; ++partition) {
+            density_partitions[partition] = geo_density_writer_create_partition(record_count,
+                                                                                 prefix_bits,
+                                                                                 partitions[partition].output_begin,
+                                                                                 partitions[partition].record_count,
+                                                                                 prefix_offsets);
+            partitions[partition].density_writer = density_partitions[partition];
+
+            if (!density_partitions[partition]) {
+                segment_compaction_destroy_density_partitions(density_partitions, merge.partition_count);
+                density_partitions = NULL;
+                break;
+            }
+        }
+
+        if (!density_partitions) {
+            free(fine_prefix_offsets);
+            free(fine_prefix_counts);
+            free(partitions);
+            geo_density_writer_destroy(density_writer);
+            free(prefix_offsets);
+
+            return false;
+        }
+
         if (worker_count > merge.partition_count) {
             worker_count = merge.partition_count;
         }
@@ -3708,6 +3680,7 @@ static bool segment_write_compacted_file(GeoIndex *const *segments,
     FILE *output = geo_io_create_atomic_file(output_path, &temporary_path);
 
     if (!output) {
+        segment_compaction_destroy_density_partitions(density_partitions, merge.partition_count);
         free(fine_prefix_offsets);
         free(fine_prefix_counts);
         free(partitions);
@@ -3736,7 +3709,7 @@ static bool segment_write_compacted_file(GeoIndex *const *segments,
     bool succeeded = fwrite(&header, sizeof(header), 1, output) == 1 && fflush(output) == 0;
 
     if (succeeded) {
-        succeeded = segment_compaction_execute(&merge, worker_count, &worker_count);
+        succeeded = segment_compaction_execute(&merge, compaction_pool, worker_count, &worker_count);
     }
 
     uint64_t records_checksum = geo_persisted_checksum_initial();
@@ -3751,7 +3724,7 @@ static bool segment_write_compacted_file(GeoIndex *const *segments,
     }
 
     if (succeeded && uses_partitioned_metadata) {
-        succeeded = segment_compaction_build_density(merge.descriptor, record_count, density_writer);
+        succeeded = geo_density_writer_merge_partitions(density_writer, density_partitions, merge.partition_count);
     }
 
     uint64_t records_bytes = record_count * sizeof(GeoRecord);
@@ -3792,6 +3765,7 @@ static bool segment_write_compacted_file(GeoIndex *const *segments,
     }
 
     free(temporary_path);
+    segment_compaction_destroy_density_partitions(density_partitions, merge.partition_count);
     free(fine_prefix_offsets);
     free(fine_prefix_counts);
     free(partitions);
@@ -3860,6 +3834,16 @@ static bool segment_set_compact_selection_locked(GeoSegmentSet *set,
 
     if (selected_physical_count > SIZE_MAX) {
         return false;
+    }
+
+    size_t desired_workers = segment_compaction_worker_count(selected_physical_count, requested_workers);
+
+    if (desired_workers > 1U && !set->compaction_pool) {
+        set->compaction_pool = geo_thread_pool_create(GEO_COMPACTION_MAX_WORKERS);
+
+        if (!set->compaction_pool) {
+            return false;
+        }
     }
 
     GeoIndex **merge_segments = malloc(selected_count * sizeof(*merge_segments));
@@ -3952,6 +3936,7 @@ static bool segment_set_compact_selection_locked(GeoSegmentSet *set,
                                                   selected_count,
                                                   selected_record_count,
                                                   output_path,
+                                                  set->compaction_pool,
                                                   requested_workers,
                                                   &workers_used,
                                                   &partitions_used);

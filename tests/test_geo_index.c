@@ -1,6 +1,8 @@
-#include "geo_index.h"
+#include "geobolt/geo_index.h"
 #include "geo_index_persistence.h"
 #include "geo_index_private.h"
+#include "geo_thread_pool.h"
+#include "geo_wal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -678,12 +680,345 @@ int test_density_metadata_mmap_roundtrip(void)
 #endif
 }
 
+static bool serialize_density_writer(GeoDensityWriter *writer,
+                                     unsigned char **serialized,
+                                     size_t *serialized_size,
+                                     uint64_t *serialized_checksum)
+{
+    FILE *file = tmpfile();
+    uint64_t bytes = 0;
+    bool succeeded = file &&
+                     geo_density_writer_append_file(writer, file, &bytes, serialized_checksum) &&
+                     bytes <= SIZE_MAX &&
+                     fflush(file) == 0 &&
+                     fseeko(file, 0, SEEK_SET) == 0;
+    unsigned char *buffer = succeeded ? malloc((size_t) bytes) : NULL;
+
+    if (succeeded && bytes && !buffer) {
+        succeeded = false;
+    }
+
+    if (succeeded && bytes) {
+        succeeded = fread(buffer, 1, (size_t) bytes, file) == (size_t) bytes;
+    }
+
+    if (file && fclose(file) != 0) {
+        succeeded = false;
+    }
+
+    if (!succeeded) {
+        free(buffer);
+
+        return false;
+    }
+
+    *serialized = buffer;
+    *serialized_size = (size_t) bytes;
+
+    return true;
+}
+
+int test_partitioned_density_matches_serial_writer(void)
+{
+    const size_t record_count = 65536U;
+    const uint8_t prefix_bits = 8U;
+    const size_t root_count = (size_t) 1U << prefix_bits;
+    const size_t split_positions[] = { 0U, 12345U, 40001U, record_count };
+    const size_t partition_count = sizeof(split_positions) / sizeof(split_positions[0]) - 1U;
+    const uint64_t root = UINT64_C(42);
+    GeoRecord *records = malloc(record_count * sizeof(*records));
+    size_t *root_offsets = malloc((root_count + 1U) * sizeof(*root_offsets));
+    GeoDensityWriter *serial = geo_density_writer_create(record_count, prefix_bits);
+    GeoDensityWriter *combined = geo_density_writer_create(record_count, prefix_bits);
+    GeoDensityWriter *partitions[partition_count];
+    bool succeeded = records && root_offsets && serial && combined;
+
+    memset(partitions, 0, sizeof(partitions));
+
+    for (size_t i = 0; succeeded && i < record_count; ++i) {
+        records[i] = (GeoRecord) {
+            .id = i + 1U,
+            .z = (root << 56U) | ((uint64_t) i << 40U),
+        };
+    }
+
+    for (size_t prefix = 0; succeeded && prefix <= root_count; ++prefix) {
+        root_offsets[prefix] = prefix <= root ? 0U : record_count;
+    }
+
+    if (succeeded) {
+        succeeded = geo_density_writer_add(serial, records, record_count, 0U);
+    }
+
+    for (size_t partition = 0; succeeded && partition < partition_count; ++partition) {
+        size_t first = split_positions[partition];
+        size_t count = split_positions[partition + 1U] - first;
+
+        partitions[partition] = geo_density_writer_create_partition(record_count,
+                                                                     prefix_bits,
+                                                                     first,
+                                                                     count,
+                                                                     root_offsets);
+        succeeded = partitions[partition] &&
+                    geo_density_writer_add(partitions[partition], records + first, count, first);
+    }
+
+    if (succeeded) {
+        succeeded = geo_density_writer_merge_partitions(combined, partitions, partition_count);
+    }
+
+    unsigned char *serial_bytes = NULL;
+    unsigned char *combined_bytes = NULL;
+    size_t serial_size = 0;
+    size_t combined_size = 0;
+    uint64_t serial_checksum = 0;
+    uint64_t combined_checksum = 0;
+
+    if (succeeded) {
+        succeeded = serialize_density_writer(serial, &serial_bytes, &serial_size, &serial_checksum) &&
+                    serialize_density_writer(combined, &combined_bytes, &combined_size, &combined_checksum);
+    }
+
+    if (succeeded && (serial_size != combined_size || serial_checksum != combined_checksum ||
+                      memcmp(serial_bytes, combined_bytes, serial_size) != 0)) {
+        size_t common_size = serial_size < combined_size ? serial_size : combined_size;
+        size_t first_difference = 0;
+
+        while (first_difference < common_size && serial_bytes[first_difference] == combined_bytes[first_difference]) {
+            first_difference++;
+        }
+
+        size_t cell_index = first_difference >= sizeof(GeoPersistedDensityHeader)
+                                ? (first_difference - sizeof(GeoPersistedDensityHeader)) / sizeof(GeoPersistedDensityCell)
+                                : SIZE_MAX;
+
+        printf("    density mismatch: serial_size=%zu combined_size=%zu serial_checksum=%" PRIu64
+               " combined_checksum=%" PRIu64 " first_difference=%zu\n",
+               serial_size,
+               combined_size,
+               serial_checksum,
+               combined_checksum,
+               first_difference);
+
+        if (cell_index != SIZE_MAX) {
+            const GeoPersistedDensityCell *serial_cells =
+                (const GeoPersistedDensityCell *) (serial_bytes + sizeof(GeoPersistedDensityHeader));
+            const GeoPersistedDensityCell *combined_cells =
+                (const GeoPersistedDensityCell *) (combined_bytes + sizeof(GeoPersistedDensityHeader));
+
+            printf("    cell=%zu serial={range=%" PRIu64 ",begin=%" PRIu64 ",end=%" PRIu64
+                   "} combined={range=%" PRIu64 ",begin=%" PRIu64 ",end=%" PRIu64 "}\n",
+                   cell_index,
+                   serial_cells[cell_index].range_min,
+                   serial_cells[cell_index].begin,
+                   serial_cells[cell_index].end,
+                   combined_cells[cell_index].range_min,
+                   combined_cells[cell_index].begin,
+                   combined_cells[cell_index].end);
+        }
+        succeeded = false;
+    }
+
+    free(combined_bytes);
+    free(serial_bytes);
+
+    for (size_t partition = 0; partition < partition_count; ++partition) {
+        geo_density_writer_destroy(partitions[partition]);
+    }
+
+    geo_density_writer_destroy(combined);
+    geo_density_writer_destroy(serial);
+    free(root_offsets);
+    free(records);
+
+    return succeeded;
+}
+
 static int compare_uint64_values(const void *first_value, const void *second_value)
 {
     uint64_t first = *(const uint64_t *) first_value;
     uint64_t second = *(const uint64_t *) second_value;
 
     return (first > second) - (first < second);
+}
+
+typedef struct {
+    atomic_uint_fast64_t worker_mask;
+    atomic_size_t call_count;
+} ThreadPoolTestContext;
+
+static bool test_thread_pool_worker(void *argument, size_t worker_index, size_t worker_count)
+{
+    ThreadPoolTestContext *context = argument;
+
+    if (worker_index >= worker_count || worker_index >= 64U) {
+        return false;
+    }
+
+    atomic_fetch_or_explicit(&context->worker_mask, UINT64_C(1) << worker_index, memory_order_relaxed);
+    atomic_fetch_add_explicit(&context->call_count, 1U, memory_order_relaxed);
+
+    return true;
+}
+
+int test_thread_pool_reuses_workers_across_generations(void)
+{
+#if defined(__unix__) || defined(__APPLE__)
+    GeoThreadPool *pool = geo_thread_pool_create(8U);
+
+    if (!pool) {
+        return 0;
+    }
+
+    size_t capacity = geo_thread_pool_capacity(pool);
+    ThreadPoolTestContext context;
+    bool succeeded = capacity >= 2U && capacity <= 8U;
+
+    atomic_init(&context.worker_mask, 0U);
+    atomic_init(&context.call_count, 0U);
+
+    for (size_t generation = 0; succeeded && generation < 32U; ++generation) {
+        size_t requested = generation % capacity + 1U;
+        size_t workers_used = 0;
+
+        atomic_store_explicit(&context.worker_mask, 0U, memory_order_relaxed);
+        atomic_store_explicit(&context.call_count, 0U, memory_order_relaxed);
+
+        succeeded = geo_thread_pool_run(pool,
+                                        requested,
+                                        test_thread_pool_worker,
+                                        &context,
+                                        &workers_used);
+
+        uint64_t expected_mask = (UINT64_C(1) << workers_used) - 1U;
+
+        succeeded = succeeded &&
+                    workers_used == requested &&
+                    atomic_load_explicit(&context.call_count, memory_order_relaxed) == workers_used &&
+                    atomic_load_explicit(&context.worker_mask, memory_order_relaxed) == expected_mask;
+    }
+
+    geo_thread_pool_destroy(pool);
+
+    return succeeded;
+#else
+    return 1;
+#endif
+}
+
+typedef struct {
+    uint64_t next_sequence;
+    uint64_t payload_checksum;
+    size_t frame_count;
+} WalReplayTestContext;
+
+static bool test_wal_replay(void *argument,
+                            uint64_t first_sequence,
+                            uint32_t entry_count,
+                            const void *payload,
+                            uint32_t payload_size)
+{
+    WalReplayTestContext *context = argument;
+
+    if (first_sequence != context->next_sequence || !entry_count) {
+        return false;
+    }
+
+    context->payload_checksum = geo_persisted_checksum_update(context->payload_checksum, payload, payload_size);
+    context->next_sequence += entry_count;
+    context->frame_count++;
+
+    return true;
+}
+
+int test_segmented_wal_recovery_rotation_and_checkpoint(void)
+{
+#if defined(__unix__) || defined(__APPLE__)
+    char directory[128];
+    char second_segment[192];
+    char third_segment[192];
+
+    snprintf(directory, sizeof(directory), "/tmp/geobolt-wal-%ld", (long) getpid());
+    snprintf(second_segment, sizeof(second_segment), "%s/wal-%020u.gbw", directory, 2U);
+    snprintf(third_segment, sizeof(third_segment), "%s/wal-%020u.gbw", directory, 3U);
+    remove(second_segment);
+    remove(third_segment);
+    rmdir(directory);
+
+    bool succeeded = mkdir(directory, S_IRWXU) == 0;
+    unsigned char *payload = succeeded ? malloc(40000U) : NULL;
+
+    if (!payload) {
+        succeeded = false;
+    }
+
+    for (size_t i = 0; succeeded && i < 40000U; ++i) {
+        payload[i] = (unsigned char) ((i * 131U + 17U) & 0xffU);
+    }
+
+    uint64_t next_sequence = 0;
+    GeoWal *wal = succeeded ? geo_wal_open(directory, 65536U, NULL, NULL, &next_sequence) : NULL;
+
+    succeeded = wal &&
+                next_sequence == 1U &&
+                geo_wal_append(wal, 1U, 2U, payload, 40000U) &&
+                geo_wal_sync(wal) &&
+                geo_wal_append(wal, 3U, 1U, payload, 40000U) &&
+                geo_wal_sync(wal);
+    geo_wal_close(wal);
+
+    WalReplayTestContext replay = {
+        .next_sequence = 1U,
+        .payload_checksum = geo_persisted_checksum_initial(),
+    };
+
+    wal = succeeded ? geo_wal_open(directory, 65536U, test_wal_replay, &replay, &next_sequence) : NULL;
+    succeeded = wal && replay.frame_count == 2U && replay.next_sequence == 4U && next_sequence == 4U;
+
+    if (succeeded) {
+        succeeded = geo_wal_append(wal, 4U, 1U, payload, 113U);
+    }
+
+    geo_wal_close(wal);
+    wal = NULL;
+
+    struct stat status;
+
+    if (succeeded) {
+        succeeded = stat(second_segment, &status) == 0 &&
+                    status.st_size > 5 &&
+                    truncate(second_segment, status.st_size - 5) == 0;
+    }
+
+    replay = (WalReplayTestContext) {
+        .next_sequence = 1U,
+        .payload_checksum = geo_persisted_checksum_initial(),
+    };
+    wal = succeeded ? geo_wal_open(directory, 65536U, test_wal_replay, &replay, &next_sequence) : NULL;
+    succeeded = wal && replay.frame_count == 2U && next_sequence == 4U && geo_wal_checkpoint(wal, 4U);
+    geo_wal_close(wal);
+
+    replay = (WalReplayTestContext) {
+        .next_sequence = 4U,
+        .payload_checksum = geo_persisted_checksum_initial(),
+    };
+    wal = succeeded ? geo_wal_open(directory, 65536U, test_wal_replay, &replay, &next_sequence) : NULL;
+    succeeded = wal && replay.frame_count == 0U && next_sequence == 4U;
+    geo_wal_close(wal);
+
+    char first_segment[192];
+
+    snprintf(first_segment, sizeof(first_segment), "%s/wal-%020u.gbw", directory, 1U);
+    remove(first_segment);
+    remove(second_segment);
+    remove(third_segment);
+    rmdir(directory);
+    free(payload);
+
+    return succeeded;
+#else
+    return 1;
+#endif
 }
 
 int test_batch_executor_ids_match_exact_queries(void)
@@ -3997,6 +4332,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_persisted_checksum_is_independent_of_write_blocks);
     RUN_TEST(test_index_persistence_rejects_corruption);
     RUN_TEST(test_density_metadata_mmap_roundtrip);
+    RUN_TEST(test_partitioned_density_matches_serial_writer);
+    RUN_TEST(test_thread_pool_reuses_workers_across_generations);
+    RUN_TEST(test_segmented_wal_recovery_rotation_and_checkpoint);
     RUN_TEST(test_batch_executor_ids_match_exact_queries);
     RUN_TEST(test_stream_builder_multi_run_roundtrip);
     RUN_TEST(test_stream_builder_single_run_direct_copy_roundtrip);

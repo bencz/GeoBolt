@@ -1,4 +1,4 @@
-#include "geo_index.h"
+#include "geobolt/geo_index.h"
 #include "geo_index_io.h"
 #include "geo_index_persistence.h"
 #include "geo_index_private.h"

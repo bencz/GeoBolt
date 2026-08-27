@@ -6,6 +6,14 @@ or internal invariant; performance measurements belong in `benchmarks/`.
 Run the complete optimized suite with `make test`, the portable fallback with `make test-scalar`, or sanitizers with
 `ASAN_OPTIONS=detect_leaks=0 make test-debug`. `TEST_FILTER=<substring>` selects a focused subset without changing the compiled code.
 
+`test_geo_index.c` validates the low-level index, SIMD backends, immutable segments, and concurrent compaction. `test_database.c`
+validates the single-server commit boundary. Its recovery case restores an older durable state watermark while retaining the newer WAL
+and already-published segment, reproducing a real crash window and proving that replay remains idempotent.
+
+`test_server.c` covers protocol corruption, authentication, persistent connections, concurrent clients, bounded work-queue rejection,
+global payload-memory backpressure, durability across restart, and reactor shutdown. `test_daemon.c` launches the real `geoboltd`
+executable, commits through the driver, delivers `SIGTERM`, and reopens the database to verify the process lifecycle and durable result.
+
 ## Uber-like actor soak
 
 `make soak-uber` runs a five-minute concurrent workload by default. A fixed publisher pool schedules thousands of independent vehicle

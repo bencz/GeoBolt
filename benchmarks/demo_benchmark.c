@@ -10,7 +10,7 @@
  *   - Various search operations (radius, KNN, bbox)
  */
 
-#include "geo_index.h"
+#include "geobolt/geo_index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

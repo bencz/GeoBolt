@@ -2,7 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
-#include "geo_index.h"
+#include "geobolt/geo_index.h"
 #include "geo_index_private.h"
 
 #include <pthread.h>

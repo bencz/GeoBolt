@@ -7,8 +7,8 @@
  *   - AWS Graviton
  */
 
-#include "geo_index_simd.h"
-#include "geo_index.h"
+#include "geobolt/geo_index_simd.h"
+#include "geobolt/geo_index.h"
 #include "geo_index_internal.h"
 #include "geo_index_simd_scalar_kernels.h"
 

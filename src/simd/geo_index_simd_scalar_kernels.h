@@ -1,9 +1,9 @@
 #ifndef GEO_INDEX_SIMD_SCALAR_KERNELS_H
 #define GEO_INDEX_SIMD_SCALAR_KERNELS_H
 
-#include "geo_index.h"
+#include "geobolt/geo_index.h"
 #include "geo_index_internal.h"
-#include "geo_index_simd.h"
+#include "geobolt/geo_index_simd.h"
 
 #include <math.h>
 #include <stdbool.h>

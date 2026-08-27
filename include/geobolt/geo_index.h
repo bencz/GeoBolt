@@ -519,7 +519,7 @@ double geo_wrap_lng(double lng);
 // =========================================================
 
 #ifndef GEO_INDEX_NO_SIMD
-#include "geo_index_simd.h"
+#include "geobolt/geo_index_simd.h"
 #endif
 
 #ifdef __cplusplus

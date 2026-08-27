@@ -1,7 +1,7 @@
 #ifndef GEOBOLT_BENCHMARK_COMMON_H
 #define GEOBOLT_BENCHMARK_COMMON_H
 
-#include "geo_index.h"
+#include "geobolt/geo_index.h"
 
 #include <errno.h>
 #include <stdio.h>
