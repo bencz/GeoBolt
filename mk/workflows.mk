@@ -6,32 +6,38 @@ demo: dirs $(DEMO_BIN)
 	@$(DEMO_BIN)
 
 # Run tests (optimized)
-test: dirs $(TEST_BIN) $(DATABASE_TEST_BIN) $(SERVER_TEST_BIN) $(DAEMON_TEST_BIN)
+test: dirs $(TEST_BIN) $(DATABASE_TEST_BIN) $(STORAGE_TEST_BIN) $(SERVER_TEST_BIN) $(DAEMON_TEST_BIN)
 	@echo "=========================================="
 	@echo "Running optimized tests..."
 	@echo "=========================================="
 	@perl -e 'alarm 120; exec @ARGV' $(TEST_BIN) $(TEST_FILTER) || (echo "Test timed out or failed!" && exit 1)
 	@$(DATABASE_TEST_BIN)
+	@$(STORAGE_TEST_BIN)
 	@$(SERVER_TEST_BIN)
 	@$(DAEMON_TEST_BIN)
 
 # Run tests (debug with sanitizers)
-test-debug: dirs $(TEST_BIN_DEBUG) $(DATABASE_TEST_BIN_DEBUG) $(SERVER_TEST_BIN_DEBUG) $(DAEMON_TEST_BIN_DEBUG)
+test-debug: dirs $(TEST_BIN_DEBUG) $(DATABASE_TEST_BIN_DEBUG) $(STORAGE_TEST_BIN_DEBUG) $(SERVER_TEST_BIN_DEBUG) \
+	$(DAEMON_TEST_BIN_DEBUG)
 	@echo "=========================================="
 	@echo "Running debug tests with sanitizers..."
 	@echo "=========================================="
 	@$(TEST_BIN_DEBUG) $(TEST_FILTER)
 	@$(DATABASE_TEST_BIN_DEBUG)
+	@$(STORAGE_TEST_BIN_DEBUG)
 	@$(SERVER_TEST_BIN_DEBUG)
 	@GEOBOLTD_TEST_BINARY=./$(DAEMON_BIN_DEBUG) $(DAEMON_TEST_BIN_DEBUG)
 
-test-scalar: dirs $(TEST_BIN_SCALAR) $(DATABASE_TEST_BIN_SCALAR) $(SERVER_TEST_BIN_SCALAR)
+test-scalar: dirs $(TEST_BIN_SCALAR) $(DATABASE_TEST_BIN_SCALAR) $(STORAGE_TEST_BIN_SCALAR) $(SERVER_TEST_BIN_SCALAR) \
+	$(DAEMON_TEST_BIN_SCALAR)
 	@echo "=========================================="
 	@echo "Running portable scalar-backend tests..."
 	@echo "=========================================="
 	@$(TEST_BIN_SCALAR) $(TEST_FILTER)
 	@$(DATABASE_TEST_BIN_SCALAR)
+	@$(STORAGE_TEST_BIN_SCALAR)
 	@$(SERVER_TEST_BIN_SCALAR)
+	@GEOBOLTD_TEST_BINARY=./$(DAEMON_BIN_SCALAR) $(DAEMON_TEST_BIN_SCALAR)
 
 # Build and run the public-API sample
 sample: dirs $(SAMPLE_BIN)
@@ -39,6 +45,9 @@ sample: dirs $(SAMPLE_BIN)
 
 client-sample: dirs $(CLIENT_SAMPLE_BIN)
 	@echo "Run with: GEOBOLT_TOKEN=secret $(CLIENT_SAMPLE_BIN) HOST PORT"
+
+metadata-sample: dirs $(METADATA_SAMPLE_BIN)
+	@echo "Run with: GEOBOLT_TOKEN=secret $(METADATA_SAMPLE_BIN) HOST PORT"
 
 # Quick benchmark
 benchmark: dirs $(TEST_BIN)
@@ -59,6 +68,9 @@ benchmark-compaction: dirs $(COMPACTION_BENCH_BIN)
 benchmark-server: dirs $(SERVER_BENCH_BIN)
 	@$(SERVER_BENCH_BIN) $(BENCHMARK_ARGS)
 
+benchmark-query-planner: dirs $(QUERY_PLANNER_BENCH_BIN)
+	@$(QUERY_PLANNER_BENCH_BIN) $(BENCHMARK_ARGS)
+
 soak-uber: dirs $(SOAK_BIN)
 	@$(SOAK_BIN) $(SOAK_ARGS)
 
@@ -68,6 +80,7 @@ soak-uber-smoke: dirs $(SOAK_BIN)
 soak-uber-tsan:
 	@$(MAKE) clean
 	@$(MAKE) USE_JEMALLOC=0 CFLAGS_OPT="-g -O1 -fno-omit-frame-pointer -fsanitize=thread" \
+		CXXFLAGS_OPT="-g -O1 -fno-omit-frame-pointer -fsanitize=thread" \
 		LDFLAGS="-fsanitize=thread" $(TEST_BIN) $(DATABASE_TEST_BIN) $(SERVER_TEST_BIN) $(DAEMON_TEST_BIN) $(SOAK_BIN)
 	@TSAN_OPTIONS=halt_on_error=1 $(TEST_BIN) writes_during_compaction
 	@TSAN_OPTIONS=halt_on_error=1 $(DATABASE_TEST_BIN)
@@ -130,6 +143,7 @@ help:
 	@echo "  test-scalar    - Build and run the portable scalar backend"
 	@echo "  sample         - Build and run the basic public-API example"
 	@echo "  client-sample  - Build the remote C-driver example"
+	@echo "  metadata-sample - Build the remote GeoDoc metadata example"
 	@echo "  demo           - Run comprehensive benchmark demo (10M points)"
 	@echo "  benchmark      - Run performance benchmarks"
 	@echo "  benchmark-tombstones - Measure mutation-filter and post-compaction fast paths"
@@ -139,6 +153,7 @@ help:
 	@echo "  soak-uber-tsan  - Rebuild with ThreadSanitizer and run the short concurrent soak"
 	@echo "  benchmark-compaction - Compare serial and partitioned Morton compaction"
 	@echo "  benchmark-server - Measure persistent-connection protocol and query throughput"
+	@echo "  benchmark-query-planner - Measure broad-metadata/small-radius planner execution"
 	@echo "  simd-benchmark - Run SIMD-specific benchmarks"
 	@echo "  allocator-info - Show allocator auto-detection details"
 	@echo "  pgo-generate    - Build instrumented binaries for representative training"

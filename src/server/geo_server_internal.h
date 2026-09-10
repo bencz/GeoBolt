@@ -25,6 +25,8 @@ struct GeoConnection {
     GeoEventSource source;
     int descriptor;
     struct GeoServer *server;
+    GeoDatabaseQueryWorkspace *query_workspace;
+    GeoSearchResult *query_result;
     GeoConnection *previous;
     GeoConnection *next;
     GeoConnection *completion_next;
@@ -43,7 +45,7 @@ struct GeoConnection {
     bool close_after_response;
 };
 
-_Static_assert(sizeof(GeoConnection) == 176U, "Connection state must remain compact enough for high connection counts");
+_Static_assert(sizeof(GeoConnection) == 192U, "Connection state must remain compact enough for high connection counts");
 
 struct GeoServer {
     GeoEventSource listener_source;
@@ -53,6 +55,7 @@ struct GeoServer {
     GeoConnection *connections;
     GeoConnection *completed_head;
     GeoConnection *completed_tail;
+    GeoConnection *retired_connections;
     pthread_mutex_t completion_lock;
     int epoll_descriptor;
     int listener_descriptor;

@@ -3,6 +3,8 @@
 The blocking C driver is exposed through `<geobolt/client.h>` and compiled into `libgeobolt.a`. It depends only on the public database
 types and the private wire codec; it never reaches into engine or storage internals. One `GeoClient` is safe for concurrent commands:
 its mutex serializes complete request/response transactions over the persistent TCP connection.
+The connection-state check uses that same mutex. After an I/O or framing failure closes the stream, queued and subsequent commands
+return `GEO_CLIENT_IO_ERROR`; destruction still requires all callers to be quiescent.
 
 Connection establishment uses nonblocking `connect` plus `poll`, so `timeout_ms` applies to the connect attempt as well as subsequent
 socket reads and writes. Small requests use one `sendmsg` for header and payload, and both endpoints enable `TCP_NODELAY` to avoid the

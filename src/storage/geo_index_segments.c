@@ -28,7 +28,7 @@
 #define GEO_SEGMENTS_SUPPORTED 0
 #endif
 
-#define GEO_MANIFEST_VERSION 4U
+#define GEO_MANIFEST_VERSION 5U
 #define GEO_MANIFEST_ENDIAN_MARKER UINT32_C(0x01020304)
 #define GEO_MANIFEST_MAX_SEGMENTS UINT64_C(1048576)
 #define GEO_MANIFEST_MAX_PATH_BYTES UINT32_C(1048576)
@@ -66,6 +66,7 @@ typedef struct {
     uint64_t mutation_count;
     uint64_t mutation_checksum;
     uint64_t mutation_slot;
+    uint64_t durable_watermark;
     uint64_t checksum;
 } GeoManifestHeader;
 
@@ -77,8 +78,10 @@ typedef struct {
     uint64_t content_checksum;
 } GeoManifestEntry;
 
-_Static_assert(sizeof(GeoManifestHeader) == 64, "GeoManifestHeader layout is persisted");
-_Static_assert(offsetof(GeoManifestHeader, checksum) == 56, "GeoManifestHeader.checksum offset is persisted");
+_Static_assert(sizeof(GeoManifestHeader) == 72, "GeoManifestHeader layout is persisted");
+_Static_assert(offsetof(GeoManifestHeader, durable_watermark) == 56,
+               "GeoManifestHeader.durable_watermark offset is persisted");
+_Static_assert(offsetof(GeoManifestHeader, checksum) == 64, "GeoManifestHeader.checksum offset is persisted");
 _Static_assert(sizeof(GeoManifestEntry) == 32, "GeoManifestEntry layout is persisted");
 _Static_assert(offsetof(GeoManifestEntry, record_count) == 8, "GeoManifestEntry.record_count offset is persisted");
 _Static_assert(offsetof(GeoManifestEntry, content_checksum) == 24, "GeoManifestEntry.content_checksum offset is persisted");
@@ -152,6 +155,7 @@ struct GeoSegmentSet {
     uint64_t mutation_count;
     uint64_t mutation_checksum;
     uint64_t mutation_slot;
+    uint64_t durable_watermark;
 #if GEO_SEGMENTS_SUPPORTED
     // Readers enter a QSBR grace period with atomics only. Writers close the gate,
     // wait for the current epoch to quiesce, publish, and then reclaim old arrays.
@@ -690,7 +694,8 @@ static uint64_t manifest_checksum(char *const *paths,
                                   uint64_t generation,
                                   uint64_t mutation_count,
                                   uint64_t mutation_checksum,
-                                  uint64_t mutation_slot)
+                                  uint64_t mutation_slot,
+                                  uint64_t durable_watermark)
 {
     uint64_t checksum = UINT64_C(1469598103934665603);
     uint64_t segment_count = count;
@@ -700,6 +705,7 @@ static uint64_t manifest_checksum(char *const *paths,
     checksum = manifest_checksum_update(checksum, &mutation_count, sizeof(mutation_count));
     checksum = manifest_checksum_update(checksum, &mutation_checksum, sizeof(mutation_checksum));
     checksum = manifest_checksum_update(checksum, &mutation_slot, sizeof(mutation_slot));
+    checksum = manifest_checksum_update(checksum, &durable_watermark, sizeof(durable_watermark));
 
     for (size_t i = 0; i < count; ++i) {
         GeoManifestEntry entry = {
@@ -725,7 +731,8 @@ static bool manifest_write(const char *manifest_path,
                            uint64_t generation,
                            uint64_t mutation_count,
                            uint64_t mutation_checksum,
-                           uint64_t mutation_slot)
+                           uint64_t mutation_slot,
+                           uint64_t durable_watermark)
 {
     if (count > GEO_MANIFEST_MAX_SEGMENTS || mutation_slot > 1U) {
         return false;
@@ -748,6 +755,7 @@ static bool manifest_write(const char *manifest_path,
         .mutation_count = mutation_count,
         .mutation_checksum = mutation_checksum,
         .mutation_slot = mutation_slot,
+        .durable_watermark = durable_watermark,
         .checksum = manifest_checksum(paths,
                                       segments,
                                       segment_generations,
@@ -755,7 +763,8 @@ static bool manifest_write(const char *manifest_path,
                                       generation,
                                       mutation_count,
                                       mutation_checksum,
-                                      mutation_slot),
+                                      mutation_slot,
+                                      durable_watermark),
     };
 
     memcpy(header.magic, GEO_MANIFEST_MAGIC, sizeof(header.magic));
@@ -1035,6 +1044,7 @@ GeoSegmentSet *geo_segment_set_create(const char *manifest_path)
                         1,
                         0,
                         UINT64_C(1469598103934665603),
+                        0,
                         0)) {
         if (set) {
             unlink(set->mutation_path);
@@ -1145,7 +1155,8 @@ GeoSegmentSet *geo_segment_set_open(const char *manifest_path)
                                       header.generation,
                                       header.mutation_count,
                                       header.mutation_checksum,
-                                      header.mutation_slot) == header.checksum;
+                                      header.mutation_slot,
+                                      header.durable_watermark) == header.checksum;
     }
 
     fclose(file);
@@ -1160,6 +1171,7 @@ GeoSegmentSet *geo_segment_set_open(const char *manifest_path)
     set->mutation_count = header.mutation_count;
     set->mutation_checksum = header.mutation_checksum;
     set->mutation_slot = header.mutation_slot;
+    set->durable_watermark = header.durable_watermark;
 
     if (set->mutation_slot) {
         char *mutation_path = segment_mutation_path(manifest_path, set->mutation_slot);
@@ -1234,18 +1246,25 @@ void geo_segment_set_destroy(GeoSegmentSet *set)
     free(set);
 }
 
-static bool segment_set_publish_file(GeoSegmentSet *set, const char *segment_path, bool upsert_all)
+static bool segment_set_publish_file(GeoSegmentSet *set,
+                                     const char *segment_path,
+                                     bool upsert_all,
+                                     bool advance_watermark,
+                                     uint64_t durable_watermark)
 {
 #if GEO_SEGMENTS_SUPPORTED
     if (!set || !segment_path || !segment_path[0] || pthread_mutex_lock(&set->mutation_lock) != 0) {
         return false;
     }
 
-    if (set->generation >= GEO_MUTATION_MAX_GENERATION) {
+    if (set->generation >= GEO_MUTATION_MAX_GENERATION ||
+        (advance_watermark && durable_watermark < set->durable_watermark)) {
         pthread_mutex_unlock(&set->mutation_lock);
 
         return false;
     }
+
+    uint64_t published_watermark = advance_watermark ? durable_watermark : set->durable_watermark;
 
     char *canonical_path = realpath(segment_path, NULL);
 
@@ -1389,7 +1408,8 @@ static bool segment_set_publish_file(GeoSegmentSet *set, const char *segment_pat
                                    new_generation,
                                    set->mutation_count + mutation_count,
                                    updated_checksum,
-                                   set->mutation_slot);
+                                   set->mutation_slot,
+                                   published_watermark);
     }
 
     if (succeeded) {
@@ -1421,6 +1441,7 @@ static bool segment_set_publish_file(GeoSegmentSet *set, const char *segment_pat
         set->record_count += segment->count;
         set->mutation_count += mutation_count;
         set->mutation_checksum = updated_checksum;
+        set->durable_watermark = published_watermark;
         segment_set_write_unlock(set);
     } else {
         free(segment_generations);
@@ -1448,6 +1469,8 @@ static bool segment_set_publish_file(GeoSegmentSet *set, const char *segment_pat
     (void) set;
     (void) segment_path;
     (void) upsert_all;
+    (void) advance_watermark;
+    (void) durable_watermark;
 
     return false;
 #endif
@@ -1455,12 +1478,19 @@ static bool segment_set_publish_file(GeoSegmentSet *set, const char *segment_pat
 
 bool geo_segment_set_add_file(GeoSegmentSet *set, const char *segment_path)
 {
-    return segment_set_publish_file(set, segment_path, false);
+    return segment_set_publish_file(set, segment_path, false, false, 0U);
 }
 
 bool geo_segment_set_upsert_file(GeoSegmentSet *set, const char *segment_path)
 {
-    return segment_set_publish_file(set, segment_path, true);
+    return segment_set_publish_file(set, segment_path, true, false, 0U);
+}
+
+bool geo_segment_set_upsert_file_at_watermark(GeoSegmentSet *set,
+                                              const char *segment_path,
+                                              uint64_t durable_watermark)
+{
+    return segment_set_publish_file(set, segment_path, true, true, durable_watermark);
 }
 
 size_t geo_segment_set_count(const GeoSegmentSet *set)
@@ -1489,17 +1519,69 @@ uint64_t geo_segment_set_record_count(const GeoSegmentSet *set)
     return record_count;
 }
 
-bool geo_segment_set_remove_ids(GeoSegmentSet *set, const uint64_t *ids, size_t count)
+uint64_t geo_segment_set_durable_watermark(const GeoSegmentSet *set)
+{
+#if GEO_SEGMENTS_SUPPORTED
+    if (!set) {
+        return 0U;
+    }
+
+    GeoSegmentSet *mutable_set = (GeoSegmentSet *) set;
+
+    if (pthread_mutex_lock(&mutable_set->mutation_lock) != 0) {
+        return 0U;
+    }
+
+    uint64_t durable_watermark = set->durable_watermark;
+
+    pthread_mutex_unlock(&mutable_set->mutation_lock);
+    return durable_watermark;
+#else
+    (void) set;
+
+    return 0U;
+#endif
+}
+
+static bool segment_set_remove_ids(GeoSegmentSet *set,
+                                   const uint64_t *ids,
+                                   size_t count,
+                                   bool advance_watermark,
+                                   uint64_t durable_watermark)
 {
 #if GEO_SEGMENTS_SUPPORTED
     if (!set || (!ids && count) || pthread_mutex_lock(&set->mutation_lock) != 0) {
         return false;
     }
 
-    if (!count) {
+    if (advance_watermark && durable_watermark < set->durable_watermark) {
         pthread_mutex_unlock(&set->mutation_lock);
 
-        return true;
+        return false;
+    }
+
+    uint64_t published_watermark = advance_watermark ? durable_watermark : set->durable_watermark;
+
+    if (!count) {
+        bool succeeded = !advance_watermark || durable_watermark == set->durable_watermark ||
+                         manifest_write(set->manifest_path,
+                                        set->paths,
+                                        set->segments,
+                                        set->segment_generations,
+                                        set->count,
+                                        set->generation,
+                                        set->mutation_count,
+                                        set->mutation_checksum,
+                                        set->mutation_slot,
+                                        published_watermark);
+
+        if (succeeded) {
+            set->durable_watermark = published_watermark;
+        }
+
+        pthread_mutex_unlock(&set->mutation_lock);
+
+        return succeeded;
     }
 
     if (set->generation >= GEO_MUTATION_MAX_GENERATION || count > SIZE_MAX / sizeof(GeoMutationRecord) ||
@@ -1546,7 +1628,8 @@ bool geo_segment_set_remove_ids(GeoSegmentSet *set, const uint64_t *ids, size_t 
                                    new_generation,
                                    set->mutation_count + count,
                                    updated_checksum,
-                                   set->mutation_slot);
+                                   set->mutation_slot,
+                                   published_watermark);
     }
 
     if (succeeded) {
@@ -1568,6 +1651,7 @@ bool geo_segment_set_remove_ids(GeoSegmentSet *set, const uint64_t *ids, size_t 
         set->generation = new_generation;
         set->mutation_count += count;
         set->mutation_checksum = updated_checksum;
+        set->durable_watermark = published_watermark;
         segment_set_write_unlock(set);
     }
 
@@ -1589,9 +1673,24 @@ bool geo_segment_set_remove_ids(GeoSegmentSet *set, const uint64_t *ids, size_t 
     (void) set;
     (void) ids;
     (void) count;
+    (void) advance_watermark;
+    (void) durable_watermark;
 
     return false;
 #endif
+}
+
+bool geo_segment_set_remove_ids(GeoSegmentSet *set, const uint64_t *ids, size_t count)
+{
+    return segment_set_remove_ids(set, ids, count, false, 0U);
+}
+
+bool geo_segment_set_remove_ids_at_watermark(GeoSegmentSet *set,
+                                             const uint64_t *ids,
+                                             size_t count,
+                                             uint64_t durable_watermark)
+{
+    return segment_set_remove_ids(set, ids, count, true, durable_watermark);
 }
 
 bool geo_segment_set_remove(GeoSegmentSet *set, uint64_t id)
@@ -1671,7 +1770,8 @@ static bool mutation_checkpoint_locked(GeoSegmentSet *set)
                                     set->generation,
                                     checkpoint_count,
                                     checkpoint_checksum,
-                                    checkpoint_slot);
+                                    checkpoint_slot,
+                                    set->durable_watermark);
 
     if (succeeded) {
         char *obsolete_path = set->mutation_path;
@@ -1888,6 +1988,55 @@ static size_t segment_filter_visible_bits(const GeoRecord *records,
             }
 
             if (!segment_mutation_entry_is_visible(entry, visibility->segment_generation)) {
+                candidate_bits[word] &= ~(UINT64_C(1) << lane);
+            }
+
+            candidates &= candidates - 1U;
+        }
+
+        matched += (size_t) __builtin_popcountll(candidate_bits[word]);
+    }
+
+    return matched;
+}
+
+typedef struct {
+    GeoSegmentVisibility visibility;
+    GeoRecordFilter external_filter;
+    void *external_context;
+    bool has_mutations;
+} GeoCombinedRecordFilter;
+
+static bool segment_combined_record_is_visible(const GeoRecord *record, void *context)
+{
+    const GeoCombinedRecordFilter *combined = context;
+
+    return (!combined->has_mutations || segment_record_is_visible_for(record, &combined->visibility)) &&
+           combined->external_filter(record, combined->external_context);
+}
+
+static size_t segment_filter_combined_bits(const GeoRecord *records,
+                                           size_t count,
+                                           uint64_t *candidate_bits,
+                                           void *context)
+{
+    GeoCombinedRecordFilter *combined = context;
+
+    if (combined->has_mutations) {
+        (void) segment_filter_visible_bits(records, count, candidate_bits, &combined->visibility);
+    }
+
+    size_t matched = 0U;
+    size_t word_count = geo_internal_bit_word_count(count);
+
+    for (size_t word = 0U; word < word_count; ++word) {
+        uint64_t candidates = candidate_bits[word];
+
+        while (candidates) {
+            unsigned lane = (unsigned) __builtin_ctzll(candidates);
+            size_t record_index = word * 64U + lane;
+
+            if (!combined->external_filter(records + record_index, combined->external_context)) {
                 candidate_bits[word] &= ~(UINT64_C(1) << lane);
             }
 
@@ -2430,6 +2579,15 @@ static bool segment_prepare_radius_query(const GeoSegmentSet *set,
                                          size_t output_record_size,
                                          GeoRadiusQueryPlan *plan)
 {
+    if (set->count == 1U) {
+        return geo_index_prepare_radius_query_for_index(set->segments[0],
+                                                        latitude,
+                                                        longitude,
+                                                        radius_km,
+                                                        output_record_size,
+                                                        plan);
+    }
+
     unsigned maximum_refinement = segment_radius_density_refinement(set, latitude, longitude);
     bool selected = false;
 
@@ -2476,55 +2634,74 @@ static bool segment_prepare_radius_query(const GeoSegmentSet *set,
     return selected;
 }
 
-bool geo_segment_set_search_radius_reuse(const GeoSegmentSet *set,
-                                         double lat,
-                                         double lng,
-                                         double radius_km,
-                                         GeoSearchResult *result,
-                                         GeoSearchStats *stats)
+static bool segment_set_search_radius_plan_filtered_snapshot(const GeoSegmentSet *set,
+                                                             const GeoRadiusQueryPlan *plan,
+                                                             GeoSearchResult *result,
+                                                             size_t *count,
+                                                             GeoRecordFilter external_filter,
+                                                             void *external_context,
+                                                             GeoSearchStats *stats)
 {
     segment_stats_reset(stats);
 
-    if (!set || !result) {
-        return false;
-    }
-
-    if (!segment_set_read_lock(set)) {
-        return false;
-    }
-
-    GeoRadiusQueryPlan plan;
-    if (!segment_prepare_radius_query(set, lat, lng, radius_km, sizeof(GeoRecord), &plan)) {
-        segment_set_read_unlock(set);
-
+    if (!set || !plan || plan->range_count <= 0 || (!result && !count) || (result && count)) {
         return false;
     }
 
     double start = stats ? geo_get_time_ms() : 0.0;
-    geo_result_clear(result);
+    size_t total_count = 0U;
     bool succeeded = true;
+
+    if (result) {
+        geo_result_clear(result);
+    }
 
     for (size_t i = 0; succeeded && i < set->count; ++i) {
         GeoSearchStats partial_stats;
+        size_t partial_count = 0U;
         GeoSegmentVisibility visibility;
+        GeoCombinedRecordFilter combined;
+        GeoRecordBitFilter bit_filter;
+        GeoRecordFilter record_filter;
+        void *filter_context;
 
         segment_visibility_initialize(&visibility, &set->mutations, set->segment_generations[i]);
 
+        if (external_filter) {
+            combined = (GeoCombinedRecordFilter) {
+                .visibility = visibility,
+                .external_filter = external_filter,
+                .external_context = external_context,
+                .has_mutations = set->mutations.count != 0U,
+            };
+            bit_filter = segment_filter_combined_bits;
+            record_filter = segment_combined_record_is_visible;
+            filter_context = &combined;
+        } else {
+            bit_filter = set->mutations.count ? segment_filter_visible_bits : NULL;
+            record_filter = set->mutations.count ? segment_record_is_visible : NULL;
+            filter_context = &visibility;
+        }
+
         succeeded = geo_index_search_radius_plan_append_filtered(set->segments[i],
-                                                                 &plan,
+                                                                 plan,
                                                                  result,
-                                                                 NULL,
+                                                                 &partial_count,
                                                                  &partial_stats,
-                                                                 set->mutations.count ? segment_filter_visible_bits : NULL,
-                                                                 set->mutations.count ? segment_record_is_visible : NULL,
-                                                                 &visibility);
+                                                                 bit_filter,
+                                                                 record_filter,
+                                                                 filter_context) &&
+                    partial_count <= SIZE_MAX - total_count;
 
         if (succeeded) {
+            total_count += partial_count;
             segment_stats_add(stats, &partial_stats);
         }
     }
 
-    if (!succeeded) {
+    if (succeeded && count) {
+        *count = total_count;
+    } else if (!succeeded && result) {
         geo_result_clear(result);
     }
 
@@ -2532,8 +2709,128 @@ bool geo_segment_set_search_radius_reuse(const GeoSegmentSet *set,
         stats->search_time_ms = geo_get_time_ms() - start;
     }
 
-    segment_set_read_unlock(set);
+    return succeeded;
+}
 
+static bool segment_set_search_radius_filtered_snapshot(const GeoSegmentSet *set,
+                                                        double latitude,
+                                                        double longitude,
+                                                        double radius_km,
+                                                        GeoSearchResult *result,
+                                                        size_t *count,
+                                                        GeoRecordFilter external_filter,
+                                                        void *external_context,
+                                                        GeoSearchStats *stats)
+{
+    GeoRadiusQueryPlan plan;
+    size_t output_record_size = result ? sizeof(GeoRecord) : 0U;
+
+    if (!segment_prepare_radius_query(set, latitude, longitude, radius_km, output_record_size, &plan)) {
+        return false;
+    }
+
+    return segment_set_search_radius_plan_filtered_snapshot(set,
+                                                            &plan,
+                                                            result,
+                                                            count,
+                                                            external_filter,
+                                                            external_context,
+                                                            stats);
+}
+
+bool geo_segment_set_search_radius_filtered(const GeoSegmentSet *set,
+                                            double latitude,
+                                            double longitude,
+                                            double radius_km,
+                                            GeoSearchResult *result,
+                                            size_t *count,
+                                            GeoRecordFilter filter,
+                                            void *filter_context,
+                                            GeoSearchStats *stats)
+{
+    if (!set || !filter || !segment_set_read_lock(set)) {
+        return false;
+    }
+
+    bool succeeded = segment_set_search_radius_filtered_snapshot(set,
+                                                                 latitude,
+                                                                 longitude,
+                                                                 radius_km,
+                                                                 result,
+                                                                 count,
+                                                                 filter,
+                                                                 filter_context,
+                                                                 stats);
+
+    segment_set_read_unlock(set);
+    return succeeded;
+}
+
+bool geo_segment_set_prepare_radius_query(const GeoSegmentSet *set,
+                                          double latitude,
+                                          double longitude,
+                                          double radius_km,
+                                          size_t output_record_size,
+                                          GeoRadiusQueryPlan *plan)
+{
+    if (!set || !plan || !segment_set_read_lock(set)) {
+        return false;
+    }
+
+    bool succeeded = segment_prepare_radius_query(set,
+                                                  latitude,
+                                                  longitude,
+                                                  radius_km,
+                                                  output_record_size,
+                                                  plan);
+
+    segment_set_read_unlock(set);
+    return succeeded;
+}
+
+bool geo_segment_set_search_radius_plan_reuse(const GeoSegmentSet *set,
+                                              const GeoRadiusQueryPlan *plan,
+                                              GeoSearchResult *result,
+                                              GeoSearchStats *stats)
+{
+    if (!set || !plan || !result || !segment_set_read_lock(set)) {
+        return false;
+    }
+
+    bool succeeded = segment_set_search_radius_plan_filtered_snapshot(set,
+                                                                      plan,
+                                                                      result,
+                                                                      NULL,
+                                                                      NULL,
+                                                                      NULL,
+                                                                      stats);
+
+    segment_set_read_unlock(set);
+    return succeeded;
+}
+
+bool geo_segment_set_search_radius_reuse(const GeoSegmentSet *set,
+                                         double lat,
+                                         double lng,
+                                         double radius_km,
+                                         GeoSearchResult *result,
+                                         GeoSearchStats *stats)
+{
+    if (!set || !segment_set_read_lock(set)) {
+        return false;
+    }
+
+    bool succeeded = segment_set_search_radius_filtered_snapshot(set,
+                                                                 lat,
+                                                                 lng,
+                                                                 radius_km,
+                                                                 result,
+                                                                 NULL,
+                                                                 NULL,
+                                                                 NULL,
+                                                                 stats);
+
+    segment_set_read_unlock(set);
     return succeeded;
 }
 
@@ -2558,69 +2855,21 @@ GeoSearchResult *geo_segment_set_search_radius(const GeoSegmentSet *set,
     return result;
 }
 
-static bool segment_set_search_radius_count_snapshot(const GeoSegmentSet *set,
-                                                     double lat,
-                                                     double lng,
-                                                     double radius_km,
-                                                     size_t *count,
-                                                     GeoSearchStats *stats)
-{
-    segment_stats_reset(stats);
-
-    if (!set || !count) {
-        return false;
-    }
-
-    GeoRadiusQueryPlan plan;
-    if (!segment_prepare_radius_query(set, lat, lng, radius_km, 0, &plan)) {
-        return false;
-    }
-
-    double start = stats ? geo_get_time_ms() : 0.0;
-    size_t total_count = 0;
-    bool succeeded = true;
-
-    for (size_t i = 0; succeeded && i < set->count; ++i) {
-        GeoSearchStats partial_stats;
-        size_t partial_count;
-        GeoSegmentVisibility visibility;
-
-        segment_visibility_initialize(&visibility, &set->mutations, set->segment_generations[i]);
-
-        succeeded = geo_index_search_radius_plan_append_filtered(set->segments[i],
-                                                                 &plan,
-                                                                 NULL,
-                                                                 &partial_count,
-                                                                 &partial_stats,
-                                                                 set->mutations.count ? segment_filter_visible_bits : NULL,
-                                                                 set->mutations.count ? segment_record_is_visible : NULL,
-                                                                 &visibility) &&
-                    partial_count <= SIZE_MAX - total_count;
-
-        if (succeeded) {
-            total_count += partial_count;
-            segment_stats_add(stats, &partial_stats);
-        }
-    }
-
-    if (succeeded) {
-        *count = total_count;
-    }
-
-    if (stats) {
-        stats->search_time_ms = geo_get_time_ms() - start;
-    }
-
-    return succeeded;
-}
-
 bool geo_segment_set_search_radius_count_snapshot(const GeoSegmentSet *set,
                                                   double latitude,
                                                   double longitude,
                                                   double radius_km,
                                                   size_t *count)
 {
-    return segment_set_search_radius_count_snapshot(set, latitude, longitude, radius_km, count, NULL);
+    return segment_set_search_radius_filtered_snapshot(set,
+                                                       latitude,
+                                                       longitude,
+                                                       radius_km,
+                                                       NULL,
+                                                       count,
+                                                       NULL,
+                                                       NULL,
+                                                       NULL);
 }
 
 bool geo_segment_set_search_radius_count(const GeoSegmentSet *set,
@@ -2634,7 +2883,15 @@ bool geo_segment_set_search_radius_count(const GeoSegmentSet *set,
         return false;
     }
 
-    bool succeeded = segment_set_search_radius_count_snapshot(set, lat, lng, radius_km, count, stats);
+    bool succeeded = segment_set_search_radius_filtered_snapshot(set,
+                                                                 lat,
+                                                                 lng,
+                                                                 radius_km,
+                                                                 NULL,
+                                                                 count,
+                                                                 NULL,
+                                                                 NULL,
+                                                                 stats);
 
     segment_set_read_unlock(set);
 
@@ -4109,7 +4366,8 @@ static bool segment_set_compact_selection_locked(GeoSegmentSet *set,
                                    new_generation,
                                    updated_mutation_count,
                                    updated_checksum,
-                                   set->mutation_slot);
+                                   set->mutation_slot,
+                                   set->durable_watermark);
     }
 
     if (succeeded) {

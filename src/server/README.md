@@ -4,6 +4,10 @@
 nonblocking accept/read/write state through `epoll`; a persistent bounded worker pool executes database commands outside that reactor.
 Each connection permits one in-flight command, which preserves request order and bounds per-connection working state.
 
+Write half-close drains complete queued requests and their ordered responses before EOF closes the connection; incomplete frames never
+reach a worker. Connection memory is reclaimed after the current epoll event batch and any running worker have released ownership.
+Worker completions coalesce eventfd notifications, and the reactor tries immediate writes before subscribing to socket writability.
+
 Admission control has three independent bounds: connection count, queued jobs, and globally retained request-payload bytes. A saturated
 job queue returns `BUSY`; a payload that would exceed the global memory budget is rejected before allocation and the connection is
 closed after its `BUSY` response because its unread body cannot safely remain in the stream. Runtime counters expose accepted/rejected

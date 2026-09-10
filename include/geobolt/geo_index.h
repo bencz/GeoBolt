@@ -238,13 +238,24 @@ bool geo_segment_set_add_file(GeoSegmentSet *set, const char *segment_path);
 // Duplicate IDs inside the input segment are rejected because a single generation cannot order them.
 bool geo_segment_set_upsert_file(GeoSegmentSet *set, const char *segment_path);
 
+// Publishes the segment and advances the durable application watermark in the same checksummed manifest replacement.
+// The watermark is monotonic and may describe a higher-level WAL or transaction sequence interpreted by the caller.
+bool geo_segment_set_upsert_file_at_watermark(GeoSegmentSet *set,
+                                              const char *segment_path,
+                                              uint64_t durable_watermark);
+
 // Linearizable logical deletion. Removed records remain in immutable segment files until compaction,
 // but are excluded from radius, bounding-box, count-only, and kNN queries immediately after publication.
 bool geo_segment_set_remove(GeoSegmentSet *set, uint64_t id);
 bool geo_segment_set_remove_ids(GeoSegmentSet *set, const uint64_t *ids, size_t count);
+bool geo_segment_set_remove_ids_at_watermark(GeoSegmentSet *set,
+                                             const uint64_t *ids,
+                                             size_t count,
+                                             uint64_t durable_watermark);
 bool geo_segment_set_checkpoint_mutations(GeoSegmentSet *set);
 size_t geo_segment_set_count(const GeoSegmentSet *set);
 uint64_t geo_segment_set_record_count(const GeoSegmentSet *set);
+uint64_t geo_segment_set_durable_watermark(const GeoSegmentSet *set);
 bool geo_segment_set_compact(GeoSegmentSet *set,
                              const char *output_path,
                              GeoSegmentCompactionStats *stats);

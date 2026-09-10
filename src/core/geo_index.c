@@ -1356,12 +1356,10 @@ static int radius_ranges(double lat, double lng, double radius, ZRange *out, int
     return cover_boxes(boxes, count, out, capacity, depth);
 }
 
-static int radius_ranges_prepared(const GeoSimdRadiusQuery *query,
-                                  double longitude,
-                                  double radius,
-                                  ZRange *out,
-                                  int capacity,
-                                  int depth)
+static int radius_boxes_prepared(const GeoSimdRadiusQuery *query,
+                                 double longitude,
+                                 double radius,
+                                 GeoNormalizedBox boxes[2])
 {
     double minimum_latitude;
     double maximum_latitude;
@@ -1378,12 +1376,22 @@ static int radius_ranges_prepared(const GeoSimdRadiusQuery *query,
                           &minimum_longitude,
                           &maximum_longitude);
 
+    return make_boxes(minimum_latitude,
+                      maximum_latitude,
+                      minimum_longitude,
+                      maximum_longitude,
+                      boxes);
+}
+
+static int radius_ranges_prepared(const GeoSimdRadiusQuery *query,
+                                  double longitude,
+                                  double radius,
+                                  ZRange *out,
+                                  int capacity,
+                                  int depth)
+{
     GeoNormalizedBox boxes[2];
-    int box_count = make_boxes(minimum_latitude,
-                               maximum_latitude,
-                               minimum_longitude,
-                               maximum_longitude,
-                               boxes);
+    int box_count = radius_boxes_prepared(query, longitude, radius, boxes);
 
     return cover_boxes(boxes, box_count, out, capacity, depth);
 }
@@ -2308,14 +2316,15 @@ bool geo_index_prepare_radius_query_for_index(const GeoIndex *index,
     }
 
     bool selected = false;
+    GeoNormalizedBox boxes[2];
+    int box_count = radius_boxes_prepared(&candidate.radius_query, longitude, radius_km, boxes);
 
-    for (int depth = minimum_depth; depth <= maximum_depth; ++depth) {
-        candidate.range_count = radius_ranges_prepared(&candidate.radius_query,
-                                                       longitude,
-                                                       radius_km,
-                                                       candidate.ranges,
-                                                       GEO_QUERY_MAX_RANGES,
-                                                       depth);
+    for (int depth = maximum_depth; depth >= minimum_depth; --depth) {
+        candidate.range_count = cover_boxes(boxes,
+                                            box_count,
+                                            candidate.ranges,
+                                            GEO_QUERY_MAX_RANGES,
+                                            depth);
 
         if (candidate.range_count <= 0) {
             continue;
@@ -2339,6 +2348,20 @@ bool geo_index_prepare_radius_query_for_index(const GeoIndex *index,
         if (!selected || candidate.estimated_cost < plan->estimated_cost) {
             *plan = candidate;
             selected = true;
+        }
+
+        GeoRadiusQueryPlan lower_bound = candidate;
+
+        lower_bound.range_count = 1;
+        radius_plan_set_cost(&lower_bound, output_record_size);
+
+        /*
+         * Coarsening a conservative Morton cover cannot reduce its candidate set. Once even
+         * a hypothetical one-range coarser cover cannot beat the best cost, every remaining
+         * depth is dominated and its recursive cover construction can be skipped.
+         */
+        if (selected && lower_bound.estimated_cost >= plan->estimated_cost) {
+            break;
         }
     }
 

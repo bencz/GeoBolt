@@ -2,7 +2,6 @@
 #include "geo_index_persistence.h"
 #include "geo_index_private.h"
 #include "geo_thread_pool.h"
-#include "geo_wal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -906,121 +905,6 @@ int test_thread_pool_reuses_workers_across_generations(void)
 #endif
 }
 
-typedef struct {
-    uint64_t next_sequence;
-    uint64_t payload_checksum;
-    size_t frame_count;
-} WalReplayTestContext;
-
-static bool test_wal_replay(void *argument,
-                            uint64_t first_sequence,
-                            uint32_t entry_count,
-                            const void *payload,
-                            uint32_t payload_size)
-{
-    WalReplayTestContext *context = argument;
-
-    if (first_sequence != context->next_sequence || !entry_count) {
-        return false;
-    }
-
-    context->payload_checksum = geo_persisted_checksum_update(context->payload_checksum, payload, payload_size);
-    context->next_sequence += entry_count;
-    context->frame_count++;
-
-    return true;
-}
-
-int test_segmented_wal_recovery_rotation_and_checkpoint(void)
-{
-#if defined(__unix__) || defined(__APPLE__)
-    char directory[128];
-    char second_segment[192];
-    char third_segment[192];
-
-    snprintf(directory, sizeof(directory), "/tmp/geobolt-wal-%ld", (long) getpid());
-    snprintf(second_segment, sizeof(second_segment), "%s/wal-%020u.gbw", directory, 2U);
-    snprintf(third_segment, sizeof(third_segment), "%s/wal-%020u.gbw", directory, 3U);
-    remove(second_segment);
-    remove(third_segment);
-    rmdir(directory);
-
-    bool succeeded = mkdir(directory, S_IRWXU) == 0;
-    unsigned char *payload = succeeded ? malloc(40000U) : NULL;
-
-    if (!payload) {
-        succeeded = false;
-    }
-
-    for (size_t i = 0; succeeded && i < 40000U; ++i) {
-        payload[i] = (unsigned char) ((i * 131U + 17U) & 0xffU);
-    }
-
-    uint64_t next_sequence = 0;
-    GeoWal *wal = succeeded ? geo_wal_open(directory, 65536U, NULL, NULL, &next_sequence) : NULL;
-
-    succeeded = wal &&
-                next_sequence == 1U &&
-                geo_wal_append(wal, 1U, 2U, payload, 40000U) &&
-                geo_wal_sync(wal) &&
-                geo_wal_append(wal, 3U, 1U, payload, 40000U) &&
-                geo_wal_sync(wal);
-    geo_wal_close(wal);
-
-    WalReplayTestContext replay = {
-        .next_sequence = 1U,
-        .payload_checksum = geo_persisted_checksum_initial(),
-    };
-
-    wal = succeeded ? geo_wal_open(directory, 65536U, test_wal_replay, &replay, &next_sequence) : NULL;
-    succeeded = wal && replay.frame_count == 2U && replay.next_sequence == 4U && next_sequence == 4U;
-
-    if (succeeded) {
-        succeeded = geo_wal_append(wal, 4U, 1U, payload, 113U);
-    }
-
-    geo_wal_close(wal);
-    wal = NULL;
-
-    struct stat status;
-
-    if (succeeded) {
-        succeeded = stat(second_segment, &status) == 0 &&
-                    status.st_size > 5 &&
-                    truncate(second_segment, status.st_size - 5) == 0;
-    }
-
-    replay = (WalReplayTestContext) {
-        .next_sequence = 1U,
-        .payload_checksum = geo_persisted_checksum_initial(),
-    };
-    wal = succeeded ? geo_wal_open(directory, 65536U, test_wal_replay, &replay, &next_sequence) : NULL;
-    succeeded = wal && replay.frame_count == 2U && next_sequence == 4U && geo_wal_checkpoint(wal, 4U);
-    geo_wal_close(wal);
-
-    replay = (WalReplayTestContext) {
-        .next_sequence = 4U,
-        .payload_checksum = geo_persisted_checksum_initial(),
-    };
-    wal = succeeded ? geo_wal_open(directory, 65536U, test_wal_replay, &replay, &next_sequence) : NULL;
-    succeeded = wal && replay.frame_count == 0U && next_sequence == 4U;
-    geo_wal_close(wal);
-
-    char first_segment[192];
-
-    snprintf(first_segment, sizeof(first_segment), "%s/wal-%020u.gbw", directory, 1U);
-    remove(first_segment);
-    remove(second_segment);
-    remove(third_segment);
-    rmdir(directory);
-    free(payload);
-
-    return succeeded;
-#else
-    return 1;
-#endif
-}
-
 int test_batch_executor_ids_match_exact_queries(void)
 {
 #if defined(__unix__) || defined(__APPLE__)
@@ -1521,8 +1405,13 @@ int test_segment_set_manifest_queries_and_compaction(void)
 
         if (succeeded) {
             geo_index_build(index);
-            succeeded = geo_index_save(index, segment_paths[segment]) &&
-                        geo_segment_set_add_file(set, segment_paths[segment]);
+            succeeded = geo_index_save(index, segment_paths[segment]);
+
+            if (succeeded) {
+                succeeded = segment + 1U == segment_count
+                                ? geo_segment_set_upsert_file_at_watermark(set, segment_paths[segment], 42U)
+                                : geo_segment_set_add_file(set, segment_paths[segment]);
+            }
         }
 
         geo_index_destroy(index);
@@ -1538,6 +1427,9 @@ int test_segment_set_manifest_queries_and_compaction(void)
         nearest_before = geo_segment_set_search_knn(set, -23.5505, -46.6333, nearest_count, 100.0, NULL);
         succeeded = geo_segment_set_count(set) == segment_count &&
                     geo_segment_set_record_count(set) == segment_count * records_per_segment &&
+                    geo_segment_set_durable_watermark(set) == 42U &&
+                    !geo_segment_set_remove_ids_at_watermark(set, NULL, 0U, 41U) &&
+                    geo_segment_set_durable_watermark(set) == 42U &&
                     geo_segment_set_search_radius_count(set, -23.5505, -46.6333, 5.0, &radius_count_before, NULL) &&
                     geo_segment_set_search_bbox_count(set, -23.60, -23.50, -46.69, -46.58, &bbox_count_before, NULL) &&
                     radius_result &&
@@ -1553,7 +1445,9 @@ int test_segment_set_manifest_queries_and_compaction(void)
     if (succeeded) {
         geo_segment_set_destroy(set);
         set = geo_segment_set_open(manifest_path);
-        succeeded = set && geo_segment_set_count(set) == segment_count;
+        succeeded = set &&
+                    geo_segment_set_count(set) == segment_count &&
+                    geo_segment_set_durable_watermark(set) == 42U;
     }
 
     GeoSegmentCompactionStats compaction_stats;
@@ -1623,7 +1517,8 @@ int test_segment_set_manifest_queries_and_compaction(void)
         set = geo_segment_set_open(manifest_path);
         succeeded = set &&
                     geo_segment_set_count(set) == 1 &&
-                    geo_segment_set_record_count(set) == segment_count * records_per_segment;
+                    geo_segment_set_record_count(set) == segment_count * records_per_segment &&
+                    geo_segment_set_durable_watermark(set) == 42U;
     }
 
     geo_segment_set_destroy(set);
@@ -1807,7 +1702,7 @@ int test_segment_set_background_tombstone_reclamation(void)
         succeeded = geo_index_add(index, first_id + i, latitude, longitude);
     }
 
-    for (size_t i = 0; i < removed_count; ++i) {
+    for (size_t i = 0; succeeded && i < removed_count; ++i) {
         removed_ids[i] = first_id + i * 2U;
     }
 
@@ -2937,7 +2832,7 @@ int test_segment_snapshot_kernels_do_not_reenter_reader_gate(void)
 
     bool removed_id_was_visible = false;
 
-    for (size_t i = 0; query.succeeded && i < query.count; ++i) {
+    for (size_t i = 0; ids && query.succeeded && i < query.count; ++i) {
         removed_id_was_visible |= ids[i] == removed_id;
     }
 
@@ -4334,7 +4229,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_density_metadata_mmap_roundtrip);
     RUN_TEST(test_partitioned_density_matches_serial_writer);
     RUN_TEST(test_thread_pool_reuses_workers_across_generations);
-    RUN_TEST(test_segmented_wal_recovery_rotation_and_checkpoint);
     RUN_TEST(test_batch_executor_ids_match_exact_queries);
     RUN_TEST(test_stream_builder_multi_run_roundtrip);
     RUN_TEST(test_stream_builder_single_run_direct_copy_roundtrip);

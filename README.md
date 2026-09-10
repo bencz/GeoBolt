@@ -2,8 +2,8 @@
 
 GeoBolt is a C11 single-server geospatial database engine and low-level spatial-index library. Each coordinate pair is normalized to two
 32-bit integers and interleaved into one 64-bit Morton code. Together with the generic 64-bit object ID, every hot indexed record
-occupies exactly 16 bytes. The database layer adds ordered WAL recovery, autonomous checkpointing, immutable publication, and
-background compaction without changing that query layout.
+occupies exactly 16 bytes. The database layer adds RocksDB-backed generic objects and GeoDoc metadata, group commit, recoverable
+immutable publication, and background compaction without changing that query layout.
 
 Design, wire-format, operational, and storage-roadmap documents are indexed in [`docs/`](docs/README.md). Public examples live in
 [`samples/`](samples/README.md).
@@ -25,9 +25,18 @@ Design, wire-format, operational, and storage-roadmap documents are indexed in [
 - Native read-only persistence with direct `mmap` queries on Unix-like systems.
 - External-memory streaming builds with bounded chunks, sorted runs, k-way merge, and atomic publication.
 - Versioned immutable segment sets with checksummed manifests, aggregate queries, and direct Morton compaction.
-- Linearizable batch deletion and ID reinsertion through a durable mutation WAL, with tombstone reclamation during compaction.
-- Single-server database root with a segmented checksummed WAL, idempotent crash recovery, durable state watermarks, and autonomous WAL
-  checkpointing and segment compaction.
+- Linearizable batch deletion and ID reinsertion through a durable mutation log, with tombstone reclamation during compaction.
+- RocksDB as the single canonical WAL/memtable/SST authority, with atomic object/metadata/spatial-delta batches and a reconstructible
+  specialized Morton index.
+- Persistent group commit that coalesces concurrent calls into fewer WAL syncs and spatial publications.
+- Canonical, checksummed GeoDoc metadata plus conditional insert, upsert, full update, point GET, and delete in protocol v4.
+- Persisted typed GeoDoc indexes for boolean, signed/unsigned integer, binary64, datetime, string, and bytes, with ordered equality/range
+  seeks, exact transactional cardinality, interrupted-build recovery, and protocol/driver administration.
+- Cost-based geo/metadata conjunctions with persisted 64-bin typed histograms, selectivity-ordered progressive intersection, reusable
+  epoch-tagged hash storage, and a choice between secondary-driven canonical lookups or Morton-driven exact geometry followed by direct
+  typed GeoDoc filtering.
+- Generic caller-supplied IDs or durable server-generated 64-bit IDs allocated atomically with insertion.
+- Durable client idempotency keys with payload-conflict detection, replay reporting, TTL, and autonomous compaction reclamation.
 - Production `geoboltd` boundary with a nonblocking `epoll` reactor, bounded persistent workers, connection/job/memory backpressure,
   token authentication, persistent TCP clients, operational counters, and coordinated signal shutdown.
 - Thread-safe blocking C driver with bounded frames, connect/read/write deadlines, endian-independent serialization, and stream
@@ -40,7 +49,7 @@ Design, wire-format, operational, and storage-roadmap documents are indexed in [
 
 ## Build
 
-Requirements are a C11 compiler, `make`, and a Unix-like environment for memory mapping.
+Requirements are C11 and C++17 compilers, RocksDB development headers/library, `make`, and a Unix-like mmap environment.
 
 ```bash
 make all
@@ -48,6 +57,8 @@ make test
 make test-debug
 make test-scalar
 make sample
+make client-sample
+make metadata-sample
 make demo
 make benchmark-tombstones
 make benchmark-server
@@ -77,7 +88,9 @@ allocator selection.
 
 Source organization is intentional: public headers live under `include/geobolt/`; production code is separated into `src/core`,
 `src/engine`, `src/query`, `src/storage`, `src/runtime`, and `src/simd`. The wire server, protocol codec, and C driver have independent
-`src/server`, `src/protocol`, and `src/client` boundaries so protocol concerns cannot leak into the storage engine. Correctness validation
+`src/server`, `src/protocol`, and `src/client` boundaries so protocol concerns cannot leak into the storage engine. Commit coordination
+is implemented by `src/engine/geo_commit_coordinator.c`; object formats and metadata live under `src/db/object` and
+`src/db/metadata`. Correctness validation
 lives in `tests/`; capacity workloads live in `benchmarks/`; complete public-API examples live in `samples/`. The root Makefile includes
 non-recursive fragments from `mk/`, retaining one dependency graph for parallel builds and LTO. The static product library is
 `build/libgeobolt.a`.
@@ -122,16 +135,24 @@ if (database && geo_database_write(database, mutations, 2) == GEO_DATABASE_OK) {
 geo_database_close(database);
 ```
 
-A batch is checksummed and synced in the segmented WAL before publication. Its derived immutable segment has a deterministic sequence
-name. The segment manifest and mutation state become durable before the database state watermark advances. Recovery can therefore
-reapply a transaction that reached publication but not the watermark without duplicating visible objects. After a configured number
-of operations, GeoBolt checkpoints the compact mutation state, creates a new durable WAL segment, and reclaims older WAL segments.
-Failures after a WAL commit poison further writes in that process so ambiguous durability is resolved only by normal recovery.
+One synchronized RocksDB `WriteBatch` atomically stores canonical objects, GeoDoc bytes, spatial deltas, and catalog sequences. The
+Morton segments are derived read indexes. Their checksummed manifest commits a durable application watermark in the same atomic
+replacement that publishes a segment. Startup reconciles that watermark with the RocksDB catalog, replays only an unpublished suffix,
+and rebuilds a missing, corrupt, or provably stale derived index from canonical objects. The native database WAL/state files were
+removed, so there is no dual-write commit decision.
 
-The current engine deliberately optimizes batch ingestion. The next storage step is a WAL-backed mutable/frozen memtable and group
-commit, which will amortize segment construction and state synchronization across independent socket clients while preserving the same
-sequence and recovery invariants. Single-operation convenience calls are correct and durable, but are not the intended maximum-
-throughput ingestion path yet.
+Concurrent writers enter one persistent commit coordinator. Unconditional upserts/deletes are combined up to a configured operation
+limit and short collection window, sharing one RocksDB sync. Conditional insert/update operations retain individual ordering for
+linearizable existence checks. Committed spatial changes append to a preallocated active memtable; full generations become frozen and
+a persistent worker collapses repeated IDs into one asynchronously published Morton segment. Queries remain exact across persisted,
+frozen, and active generations. RocksDB's block cache is shared across column families and its write-buffer manager enforces one global
+memtable budget.
+
+Derived segment bodies and mutation-log bytes are synchronized before the spatial manifest may reference them. Per-file checksums make
+corruption detectable and allow the cache to be rebuilt from canonical RocksDB state after a crash.
+
+Callers may supply any nonzero ID or use `geo_database_insert_generated_document` / `geo_client_insert_generated`. Generated IDs come
+from a durable high-range monotonic allocator; advancing the allocator and inserting the object are one RocksDB transaction.
 
 ## Core API
 
@@ -346,12 +367,13 @@ geo_segment_set_compact_with_workers(segments, "segment-compacted-manual.geobolt
 geo_segment_set_destroy(segments);
 ```
 
-Deletion is logical on publication and physical on compaction. A mutation is first appended and synced to the manifest-adjacent
-WAL; the new manifest generation then commits the exact WAL prefix. Two crash-safe WAL slots allow checkpoints to rewrite only active
-ID states and publish the replacement through the manifest before reclaiming the old slot. Checkpointing is automatic when historical
+Deletion in the standalone segment-set API is logical on publication and physical on compaction. A mutation is first appended and
+synced to its manifest-adjacent mutation WAL; this is separate from the database engine's canonical RocksDB WAL. The new manifest
+generation then commits the exact mutation-WAL prefix. Two crash-safe slots allow checkpoints to rewrite only active ID states and
+publish the replacement through the manifest before reclaiming the old slot. Checkpointing is automatic when historical
 operations exceed four times the active mutation cardinality, and remains explicitly callable for operational control. A crash can
-therefore leave only an ignored WAL tail or obsolete slot, never a manifest that references an incomplete deletion. Queries consult a
-sparse ID exception table only when removals or reinsertions exist. Untouched IDs retain the original 16-byte record and the
+therefore leave only an ignored mutation-log tail or obsolete slot, never a manifest that references an incomplete deletion. Queries
+consult a sparse ID exception table only when removals or reinsertions exist. Untouched IDs retain the original 16-byte record and the
 mutation-free query path has no hash lookup. Each in-memory exception keeps a naturally aligned 16-byte payload: occupancy, state, and
 generation are encoded in one 64-bit metadata word, placing four payloads in a 64-byte cache line without packed or unaligned
 structures. A separate one-byte-per-slot control array stores nonzero hash fingerprints. Lookups inspect controls eight at a time with
@@ -422,11 +444,12 @@ L1-resident coordinate arrays. Define `GEO_SIMD_FORCE_SCALAR` to compile the por
 
 ## Current validation
 
-The current x86-64 validation run completed 69/69 optimized tests with Clang 22 and GCC, plus 69/69
-AddressSanitizer/UndefinedBehaviorSanitizer tests. The forced scalar backend completed 58/58 applicable tests. ThreadSanitizer completed
-the affected segment paths, including automatic tombstone reclamation, simultaneous insert/remove, writes during an active merge, and
-a writer waiting behind a two-pass query snapshot. Clang's static analyzer completed the changed translation units
-without diagnostics. The ARM64 source shares the same scalar tail semantics, but the changes in this revision have not yet been
+The current x86-64 validation run completed 71/71 optimized low-level tests with Clang 22 and GCC, followed by the database, storage,
+server, and daemon suites in both compiler builds. AddressSanitizer/UndefinedBehaviorSanitizer completed the same 71/71 low-level tests
+and every subsystem suite. The forced scalar backend completed 60/60 applicable low-level tests plus database, storage, server, and a
+separately linked scalar daemon. ThreadSanitizer completed the affected segment, database, server, daemon, and 15-second concurrent soak
+paths with zero reported races or workload failures. Clang's static analyzer completed every changed C translation unit with analyzer
+warnings treated as errors. The ARM64 source shares the same scalar tail semantics, but the changes in this revision have not yet been
 validated with an AArch64 sysroot or ARM64 hardware.
 
 The following x86-64 ranges came from four consecutive runs on an otherwise idle development host. Deployment capacity measurements
@@ -456,6 +479,14 @@ queries improved from 3.075–3.154 seconds to 0.473–0.477 seconds, a 6.45–6
 scanned 96,385 candidates instead of all 500,000 records. On a separate globally uniform 100,000-record workload, the median time for
 10,000 queries changed from 7.880 ms to 7.912 ms, a difference of approximately 0.4% and within run-to-run noise. The hotspot-specific
 speedup should not be extrapolated to globally uniform data.
+
+The database conjunction planner was separately measured with 100,000 uniformly gridded objects, one broad boolean predicate matching
+every object, 50 warmed one-kilometre radius queries, one query thread, Clang 22.1.8, the runtime AVX-512 backend, and jemalloc. Changing
+the geography-driven plan from full secondary-range materialization to exact spatial selection plus bounded canonical GeoDoc filtering
+reduced the median of four baseline runs and five optimized runs from 625.496 ms to 1.103 ms, a 567.09x speedup and 99.8237% latency
+reduction. Secondary entries scanned fell from 5,000,000 to zero; the optimized path performed 344 canonical lookups. Both versions
+returned 344 records with checksum 3998473243504071514. CPU affinity, frequency, and host-idle state were not independently verified,
+so this large algorithmic result must not be treated as a production capacity figure or extrapolated to metadata-selective workloads.
 
 In a separate idle-host batch audit, 100,000 exact 50 km ID queries over one million records took 149.07–155.25 ms sequentially. The
 persistent eight-worker executor completed both count and fill passes in 41.02–44.04 ms, a 3.47–3.66x speedup, and produced the same
@@ -577,9 +608,12 @@ The checked-in `.clang-format` documents the intended layout.
 
 ## Remaining directions
 
-- WAL-backed mutable/frozen memtables, group commit, reusable flush scratch, and backpressure based on dirty bytes rather than request
-  count.
-- Generic metadata schemas and columnar property storage joined to the hot `object_id`/Morton index without widening `GeoRecord`.
+- Nonblocking typed-index builds with snapshot/delta catch-up; the current recoverable builder keeps reads live but pauses writers.
+- Autonomous histogram reanalysis after significant distribution drift, plus bounded iterator/result streaming for broad typed
+  predicates. Persisted histogram counts, selectivity ordering, progressive intersections, and bounded reusable canonical `MultiGet`
+  reads are implemented.
+- Partial GeoDoc `SET`/`UNSET` patches.
+- A longer-lived specialized spatial memtable/frozen flush layer on top of the implemented RocksDB memtables and group commit.
 - Portable, checksummed, cross-endian persistence format.
 - Multi-level compaction with record-count/byte-size policies and retention-aware garbage collection.
 - Optional Hilbert ordering for workloads where its improved locality offsets the higher encoding cost.

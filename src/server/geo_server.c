@@ -108,9 +108,30 @@ static void server_release_request_payload(GeoConnection *connection)
 static void server_free_connection(GeoConnection *connection)
 {
     server_unlink_connection(connection);
+    geo_database_query_workspace_destroy(connection->query_workspace);
+    geo_result_destroy(connection->query_result);
     free(connection->response);
     server_release_request_payload(connection);
     free(connection);
+}
+
+static void server_retire_connection(GeoConnection *connection)
+{
+    /* epoll_wait may have returned this pointer alongside a worker completion. Keep the
+     * object alive until the entire event batch has been consumed. No worker owns it now,
+     * so completion_next can serve as the retirement link without widening GeoConnection. */
+    connection->completion_next = connection->server->retired_connections;
+    connection->server->retired_connections = connection;
+}
+
+static void server_reclaim_connections(GeoServer *server)
+{
+    while (server->retired_connections) {
+        GeoConnection *connection = server->retired_connections;
+
+        server->retired_connections = connection->completion_next;
+        server_free_connection(connection);
+    }
 }
 
 static void server_close_connection(GeoConnection *connection)
@@ -128,7 +149,7 @@ static void server_close_connection(GeoConnection *connection)
     }
 
     if (!connection->job_inflight) {
-        server_free_connection(connection);
+        server_retire_connection(connection);
     }
 }
 
@@ -171,6 +192,25 @@ bool geo_server_prepare_response(GeoConnection *connection,
     return true;
 }
 
+static bool server_signal_wakeup(GeoServer *server)
+{
+    uint64_t signal_value = 1U;
+
+    for (;;) {
+        ssize_t written = write(server->wakeup_descriptor, &signal_value, sizeof(signal_value));
+
+        if (written == (ssize_t) sizeof(signal_value)) {
+            return true;
+        }
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+
+        /* A saturated eventfd is already readable; the pending notification suffices. */
+        return written < 0 && errno == EAGAIN;
+    }
+}
+
 void geo_server_complete_job(GeoConnection *connection)
 {
     GeoServer *server = connection->server;
@@ -181,6 +221,8 @@ void geo_server_complete_job(GeoConnection *connection)
         return;
     }
 
+    bool needs_wakeup = server->completed_head == NULL;
+
     connection->completion_next = NULL;
 
     if (server->completed_tail) {
@@ -190,12 +232,11 @@ void geo_server_complete_job(GeoConnection *connection)
     }
 
     server->completed_tail = connection;
-    pthread_mutex_unlock(&server->completion_lock);
-
-    uint64_t signal_value = 1U;
-    ssize_t ignored = write(server->wakeup_descriptor, &signal_value, sizeof(signal_value));
-
-    (void) ignored;
+    if (pthread_mutex_unlock(&server->completion_lock) != 0 ||
+        (needs_wakeup && !server_signal_wakeup(server))) {
+        atomic_store_explicit(&server->event_loop_failed, true, memory_order_release);
+        geo_server_request_stop(server);
+    }
 }
 
 static void server_reset_request(GeoConnection *connection)
@@ -218,12 +259,14 @@ static bool server_dispatch_request(GeoConnection *connection)
 
         server_reset_request(connection);
 
-        return server_epoll_modify(connection, EPOLLOUT | EPOLLRDHUP);
+        return server_epoll_modify(connection, EPOLLOUT);
     }
 
     connection->job_inflight = true;
 
-    return server_epoll_modify(connection, EPOLLRDHUP);
+    /* FIN does not cancel a complete request. ERR/HUP remain reported by epoll even with
+     * an empty interest mask; only the worker completion may hand response ownership back. */
+    return server_epoll_modify(connection, 0);
 }
 
 static bool server_read_connection(GeoConnection *connection)
@@ -236,8 +279,8 @@ static bool server_read_connection(GeoConnection *connection)
             destination = connection->encoded_header + connection->header_received;
             remaining = GEO_PROTOCOL_HEADER_SIZE - connection->header_received;
         } else {
-            destination = connection->request_payload + connection->payload_received;
             remaining = connection->request_header.payload_size - connection->payload_received;
+            destination = remaining ? connection->request_payload + connection->payload_received : NULL;
         }
 
         if (!remaining) {
@@ -252,7 +295,7 @@ static bool server_read_connection(GeoConnection *connection)
                 if (connection->request_header.payload_size > connection->server->max_frame_size) {
                     connection->close_after_response = true;
                     return geo_server_prepare_response(connection, GEO_PROTOCOL_STATUS_FRAME_TOO_LARGE, NULL, 0) &&
-                           server_epoll_modify(connection, EPOLLOUT | EPOLLRDHUP);
+                           server_epoll_modify(connection, EPOLLOUT);
                 }
 
                 connection->header_decoded = true;
@@ -267,7 +310,7 @@ static bool server_read_connection(GeoConnection *connection)
                         connection->close_after_response = true;
 
                         return geo_server_prepare_response(connection, GEO_PROTOCOL_STATUS_BUSY, NULL, 0) &&
-                               server_epoll_modify(connection, EPOLLOUT | EPOLLRDHUP);
+                               server_epoll_modify(connection, EPOLLOUT);
                     }
 
                     connection->request_payload = malloc(connection->request_header.payload_size);
@@ -343,7 +386,8 @@ static bool server_write_connection(GeoConnection *connection)
             continue;
         }
 
-        return written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        return written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+               server_epoll_modify(connection, EPOLLOUT);
     }
 
     free(connection->response);
@@ -362,7 +406,14 @@ static bool server_process_completions(GeoServer *server)
 {
     uint64_t value;
 
-    while (read(server->wakeup_descriptor, &value, sizeof(value)) < 0 && errno == EINTR) {
+    ssize_t received;
+
+    do {
+        received = read(server->wakeup_descriptor, &value, sizeof(value));
+    } while (received < 0 && errno == EINTR);
+
+    if (received != (ssize_t) sizeof(value) && !(received < 0 && errno == EAGAIN)) {
+        return false;
     }
 
     if (pthread_mutex_lock(&server->completion_lock) != 0) {
@@ -373,7 +424,9 @@ static bool server_process_completions(GeoServer *server)
 
     server->completed_head = NULL;
     server->completed_tail = NULL;
-    pthread_mutex_unlock(&server->completion_lock);
+    if (pthread_mutex_unlock(&server->completion_lock) != 0) {
+        return false;
+    }
 
     while (completed) {
         GeoConnection *next = completed->completion_next;
@@ -383,10 +436,9 @@ static bool server_process_completions(GeoServer *server)
         atomic_fetch_add_explicit(&server->completed_requests, 1U, memory_order_relaxed);
         server_reset_request(completed);
 
-        if (completed->closing || !completed->response ||
-            !server_epoll_modify(completed, EPOLLOUT | EPOLLRDHUP)) {
+        if (completed->closing || !completed->response || !server_write_connection(completed)) {
             if (completed->closing) {
-                server_free_connection(completed);
+                server_retire_connection(completed);
             } else {
                 server_close_connection(completed);
             }
@@ -605,10 +657,9 @@ void geo_server_request_stop(GeoServer *server)
     atomic_store_explicit(&server->stop_requested, true, memory_order_release);
 
     if (server->wakeup_descriptor >= 0) {
-        uint64_t signal_value = 1U;
-        ssize_t ignored = write(server->wakeup_descriptor, &signal_value, sizeof(signal_value));
-
-        (void) ignored;
+        if (!server_signal_wakeup(server)) {
+            atomic_store_explicit(&server->event_loop_failed, true, memory_order_release);
+        }
     }
 }
 
@@ -664,18 +715,24 @@ GeoServerStatus geo_server_run(GeoServer *server)
             uint32_t ready = events[event_index].events;
             bool succeeded = true;
 
-            if ((ready & EPOLLIN) && !connection->job_inflight && !connection->response) {
+            if (connection->closing) {
+                continue;
+            }
+
+            if ((ready & (EPOLLIN | EPOLLRDHUP)) && !connection->job_inflight && !connection->response) {
                 succeeded = server_read_connection(connection);
             }
 
-            if (succeeded && (ready & EPOLLOUT) && connection->response) {
+            if (succeeded && (ready & EPOLLOUT) && !connection->job_inflight && connection->response) {
                 succeeded = server_write_connection(connection);
             }
 
-            if (!succeeded || (ready & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))) {
+            if (!succeeded || (ready & (EPOLLERR | EPOLLHUP))) {
                 server_close_connection(connection);
             }
         }
+
+        server_reclaim_connections(server);
     }
 
     if (atomic_load_explicit(&server->event_loop_failed, memory_order_acquire)) {
